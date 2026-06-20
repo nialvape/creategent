@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir \
     imageio \
     imageio-ffmpeg
 
-COPY handler.py /app/handler.py
+# RunPod's GitHub builder uses the REPO ROOT as the build context, so this path
+# is repo-root-relative (not relative to this Dockerfile's folder).
+COPY runpod/wan/handler.py /app/handler.py
 
 CMD ["python", "-u", "handler.py"]

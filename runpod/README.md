@@ -30,16 +30,18 @@ If the repo is **private**, register the pull credentials with RunPod first
 The endpoints currently use **pod-style templates** (Jupyter + SSH, no handler) —
 that's why jobs queue forever with no worker. Convert each to a serverless worker:
 
-**RunPod Console** → Serverless → the endpoint → Edit → its Template:
-- **Container Image** = the image you just pushed (e.g. `YOURUSER/creategent-chatterbox:latest`)
-- **Container Start Command** = leave empty (the Dockerfile `CMD` runs the handler)
-- Turn **off** "Start Jupyter" / "Start SSH"
-- Keep the **env vars** (`MODEL_PATH`, `HF_HOME`) and the **network volume** attached
-- Bump **Container Disk** to ~15–20 GB (the 5 GB on chatterbox is tight for the image)
-- Save → the endpoint redeploys on the new image.
-
-(Or ask me — I can do this over the RunPod MCP with `update-template` / by creating
-fresh serverless templates and repointing the endpoints.)
+**RunPod Console** → Serverless → **New Endpoint** → "Import Git Repository" →
+pick `nialvape/creategent`, then:
+- **Branch** = `master`
+- **Dockerfile Path** = `runpod/chatterbox/Dockerfile` (or `runpod/wan/Dockerfile`)
+  — RunPod's GitHub builder uses the **repo root** as the build context (there is
+  no separate build-context field), which is why the Dockerfiles `COPY` from
+  repo-root-relative paths.
+- Next → **GPU** (RTX 5090 for chatterbox, H100 for wan), **env vars**
+  (`MODEL_PATH`, `HF_HOME`), workers min 0.
+- After it's created, open the endpoint settings to attach the **Network Volume**
+  (`fs37zsln52`) and bump **Container Disk** (~15–20 GB) if those weren't offered
+  during creation.
 
 ## 3. Smoke-test the endpoint
 

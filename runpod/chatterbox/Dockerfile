@@ -8,7 +8,9 @@ WORKDIR /app
 # chatterbox-tts pulls its own deps; torch/torchaudio are already in the base.
 RUN pip install --no-cache-dir runpod chatterbox-tts
 
-COPY handler.py /app/handler.py
+# RunPod's GitHub builder uses the REPO ROOT as the build context, so this path
+# is repo-root-relative (not relative to this Dockerfile's folder).
+COPY runpod/chatterbox/handler.py /app/handler.py
 
 # Serverless workers just run the handler; no Jupyter/SSH.
 CMD ["python", "-u", "handler.py"]
