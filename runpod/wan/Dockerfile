@@ -1,6 +1,9 @@
 # Wan image-to-video serverless worker.
 # Weights come from the network volume (MODEL_PATH=/runpod-volume/Wan2.2-I2V).
-FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+#
+# Base: torch 2.6.0 + CUDA 12.4 — CUDA 12.4 (not 12.8) so the container starts
+# on hosts with older NVIDIA drivers.
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 WORKDIR /app
 
