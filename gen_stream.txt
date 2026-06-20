@@ -1,0 +1,4 @@
+data: {"type":"status","node":"creative_director"}
+
+data: {"type":"text","text":"Style brief created. Starting content generation..."}
+
