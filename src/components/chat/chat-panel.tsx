@@ -1,8 +1,8 @@
 'use client'
 
 import { useState, useCallback, useId, useRef, useEffect } from 'react'
-import { MessageList, type ChatMessage } from './message-list'
-import { MessageInput } from './message-input'
+import { MessageList, type ChatMessage, type MessageAttachment } from './message-list'
+import { MessageInput, type Attachment } from './message-input'
 import { CostSummaryCard } from './cost-summary-card'
 import type { ContentPlan } from '@/types/plan'
 import type { GraphStatus, GenerationProgress } from '@/types/graph-state'
@@ -44,6 +44,7 @@ function saveChat(projectId: string, data: PersistedChat) {
 export function ChatPanel({ projectId, projectSettings, onGenerationStarted, onGenerationComplete, onTitleGenerated }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
+  const [attachments, setAttachments] = useState<Attachment[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
   const threadIdRef = useRef<string>(`thread_${projectId}`)
   const [graphStatus, setGraphStatus] = useState<GraphStatus>('idle')
@@ -190,28 +191,74 @@ export function ChatPanel({ projectId, projectSettings, onGenerationStarted, onG
     }
   }, [newId, onGenerationComplete])
 
-  const handleSend = useCallback(() => {
-    if (!input.trim() || isStreaming) return
-    const userMessage: ChatMessage = { id: newId(), role: 'user', content: input }
+  const handleSend = useCallback(async () => {
+    if ((!input.trim() && attachments.length === 0) || isStreaming) return
+    const pending = attachments
+    const text = input
     const isFirstMessage = messages.length === 0
+
+    const userMessage: ChatMessage = {
+      id: newId(),
+      role: 'user',
+      content: text,
+      // Optimistic previews use the composer's object URLs; swapped for public
+      // URLs once the uploads finish below.
+      attachments: pending.map((a) => ({ url: a.url, kind: a.kind, name: a.file.name, mimeType: a.file.type })),
+    }
     setMessages((prev) => [...prev, userMessage])
+    setInput('')
+    // Hand object-URL ownership to the message — clear the composer WITHOUT
+    // revoking, so the in-conversation previews keep rendering.
+    setAttachments([])
     setGraphStatus('planning')
 
+    // Upload media to the project's storage bucket so the agent can fetch each
+    // reference by URL. Media handed to the agent is always attached as a file.
+    let uploaded: MessageAttachment[] = []
+    if (pending.length > 0) {
+      try {
+        uploaded = await Promise.all(
+          pending.map(async (a) => {
+            const form = new FormData()
+            form.append('file', a.file)
+            form.append('projectId', projectId)
+            const res = await fetch('/api/upload', { method: 'POST', body: form })
+            if (!res.ok) throw new Error(`Upload failed (${res.status})`)
+            const { url } = (await res.json()) as { url: string }
+            return { url, kind: a.kind, name: a.file.name, mimeType: a.file.type }
+          })
+        )
+        // Swap optimistic blob URLs for persistent public URLs, then revoke blobs.
+        setMessages((prev) =>
+          prev.map((m) => (m.id === userMessage.id ? { ...m, attachments: uploaded } : m))
+        )
+        for (const a of pending) URL.revokeObjectURL(a.url)
+      } catch (err) {
+        setMessages((prev) => [
+          ...prev,
+          { id: newId(), role: 'assistant', content: `Error uploading media: ${String(err)}` },
+        ])
+        setGraphStatus('idle')
+        return
+      }
+    }
+
     sendToAPI({
-      messages: [...messages, userMessage],
+      messages: [...messages, { role: 'user', content: text }],
       threadId: threadIdRef.current,
       projectId,
       projectSettings,
+      attachments: uploaded,
     })
 
     // Fire-and-forget smart title generation from the very first idea. The
     // endpoint only overwrites the default placeholder title, so this is a
     // no-op once the user has named the project themselves.
-    if (isFirstMessage) {
+    if (isFirstMessage && text.trim()) {
       fetch(`/api/projects/${projectId}/title`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idea: input }),
+        body: JSON.stringify({ idea: text }),
       })
         .then((r) => (r.ok ? r.json() : null))
         .then((p) => {
@@ -219,9 +266,7 @@ export function ChatPanel({ projectId, projectSettings, onGenerationStarted, onG
         })
         .catch(() => {})
     }
-
-    setInput('')
-  }, [input, isStreaming, messages, projectId, projectSettings, sendToAPI, onTitleGenerated])
+  }, [input, attachments, isStreaming, messages, projectId, projectSettings, sendToAPI, onTitleGenerated, newId])
 
   const handleApprove = useCallback(() => {
     setAwaitingApproval(false)
@@ -263,6 +308,8 @@ export function ChatPanel({ projectId, projectSettings, onGenerationStarted, onG
         value={input}
         onChange={setInput}
         onSend={handleSend}
+        attachments={attachments}
+        onAttachmentsChange={setAttachments}
         disabled={isStreaming || awaitingApproval}
         placeholder={awaitingApproval ? 'Waiting for plan approval...' : 'Describe your content idea...'}
       />

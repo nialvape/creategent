@@ -163,7 +163,21 @@ export async function plannerNode(
   const orchestrationModel = getOrchestrationModel(state.projectSettings)
   const writingModel = getWritingModel(state.projectSettings)
 
-  const prompt = `User's content idea: ${state.userIdea}
+  const referenceMedia = state.referenceMedia ?? []
+  const referenceBlock =
+    referenceMedia.length > 0
+      ? `\n\n## Reference files the user attached (${referenceMedia.length})
+A per-type understanding sub-agent analyzed each file and wrote the description below. It is YOUR job to infer WHAT PURPOSE each file serves for this request — e.g. a brand/style reference to match, a product photo to feature, a person's portrait to animate as an avatar, a logo to include, a voice sample whose delivery to emulate, or b-roll to reference — and reflect that in the plan (mention how each provided file is used in the relevant asset's description, and match the style of any style references). Do not ignore a provided file.
+
+${referenceMedia
+  .map(
+    (m, i) =>
+      `${i + 1}. [${m.kind}] "${m.name}"\n   Description: ${m.description ?? '(not analyzed)'}`
+  )
+  .join('\n')}`
+      : ''
+
+  const prompt = `User's content idea: ${state.userIdea}${referenceBlock}
 
 Project settings:
 - Target platforms: ${state.projectSettings.targetPlatforms.join(', ')}

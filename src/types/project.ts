@@ -9,9 +9,10 @@ export interface ProjectSettings {
   preferredAvatarModel: string
   preferredAudioModel: string
   /**
-   * Optional reference voice sample (public audio URL) for zero-shot voice
-   * cloning. Used only by Chatterbox (runpod/chatterbox): when set, every
-   * voiceover in the project is synthesized in this voice.
+   * Optional reference voice sample for zero-shot voice cloning. Holds the
+   * public storage URL of a media file the user attached to the project (never
+   * a hand-pasted link). Used only by Chatterbox (runpod/chatterbox): when set,
+   * every voiceover in the project is synthesized in this voice.
    */
   voiceCloneReferenceUrl?: string
   /** Used by planner, creative director, review — needs strong reasoning */

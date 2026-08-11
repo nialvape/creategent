@@ -1,10 +1,11 @@
 'use client'
 
+import { useRef, useState } from 'react'
 import { Label } from '@/components/ui/label'
-import { Input } from '@/components/ui/input'
 import { ModelPicker } from '@/components/ui/model-picker'
 import { LLM_MODELS, IMAGE_MODELS, VIDEO_MODELS, AVATAR_MODELS, AUDIO_MODELS } from '@/lib/models'
 import type { ProjectSettings, QualityPreset } from '@/types/project'
+import { Upload, Loader2, Check, X } from 'lucide-react'
 
 const PLATFORMS = ['instagram', 'tiktok', 'youtube', 'x', 'linkedin', 'facebook']
 const QUALITY_PRESETS: { value: QualityPreset; label: string; description: string }[] = [
@@ -16,9 +17,22 @@ const QUALITY_PRESETS: { value: QualityPreset; label: string; description: strin
 interface ProjectSettingsFormProps {
   settings: ProjectSettings
   onChange: (settings: ProjectSettings) => void
+  /**
+   * 'base'    → home-page defaults for every new project (no project exists yet).
+   * 'project' → a specific project's settings; enables project-specific media
+   *             like a voice-clone reference sample.
+   */
+  context?: 'base' | 'project'
+  /** Required when context is 'project' — the bucket path media is uploaded under. */
+  projectId?: string
 }
 
-export function ProjectSettingsForm({ settings, onChange }: ProjectSettingsFormProps) {
+export function ProjectSettingsForm({
+  settings,
+  onChange,
+  context = 'project',
+  projectId,
+}: ProjectSettingsFormProps) {
   const set = (patch: Partial<ProjectSettings>) => onChange({ ...settings, ...patch })
 
   const togglePlatform = (platform: string) => {
@@ -28,6 +42,31 @@ export function ProjectSettingsForm({ settings, onChange }: ProjectSettingsFormP
         ? current.filter((p) => p !== platform)
         : [...current, platform],
     })
+  }
+
+  const voiceFileRef = useRef<HTMLInputElement>(null)
+  const [uploadingVoice, setUploadingVoice] = useState(false)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+
+  const handleVoiceFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-selecting the same file
+    if (!file || !projectId) return
+    setVoiceError(null)
+    setUploadingVoice(true)
+    try {
+      const body = new FormData()
+      body.append('file', file)
+      body.append('projectId', projectId)
+      const res = await fetch('/api/upload', { method: 'POST', body })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Upload failed')
+      set({ voiceCloneReferenceUrl: data.url })
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : 'Upload failed')
+    } finally {
+      setUploadingVoice(false)
+    }
   }
 
   return (
@@ -140,19 +179,55 @@ export function ProjectSettingsForm({ settings, onChange }: ProjectSettingsFormP
         />
       </div>
 
-      {/* Voice cloning — only Chatterbox (runpod/chatterbox) supports it */}
-      {settings.preferredAudioModel === 'runpod/chatterbox' && (
+      {/* Voice cloning — project-specific, so it only shows for a real project
+          (not in the home-page base defaults). Only Chatterbox supports it. */}
+      {context === 'project' && settings.preferredAudioModel === 'runpod/chatterbox' && (
         <div className="space-y-2">
           <Label className="text-white/50 text-xs uppercase tracking-wider">Voice Clone Reference</Label>
           <p className="text-[11px] text-white/30 -mt-1">
-            Public URL to a short voice sample. Chatterbox clones it, so every voiceover speaks in that voice. Leave empty for the default voice.
+            Attach a short voice sample. Chatterbox clones it, so every voiceover speaks in that voice. Leave empty for the default voice.
           </p>
-          <Input
-            type="url"
-            placeholder="https://…/voice-sample.wav"
-            value={settings.voiceCloneReferenceUrl ?? ''}
-            onChange={(e) => set({ voiceCloneReferenceUrl: e.target.value || undefined })}
+          <input
+            ref={voiceFileRef}
+            type="file"
+            accept="audio/*"
+            className="hidden"
+            onChange={handleVoiceFile}
           />
+          {settings.voiceCloneReferenceUrl ? (
+            <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2">
+              <Check className="h-3.5 w-3.5 flex-shrink-0 text-emerald-400" />
+              <span className="flex-1 truncate text-xs text-white/60">Voice sample attached</span>
+              <button
+                type="button"
+                onClick={() => set({ voiceCloneReferenceUrl: undefined })}
+                className="text-white/40 hover:text-white/80 transition-colors"
+                aria-label="Remove voice sample"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => voiceFileRef.current?.click()}
+              disabled={uploadingVoice}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-white/15 bg-white/[0.02] px-3 py-2.5 text-xs text-white/50 hover:border-white/30 hover:text-white/70 transition-colors disabled:opacity-50"
+            >
+              {uploadingVoice ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Uploading…
+                </>
+              ) : (
+                <>
+                  <Upload className="h-3.5 w-3.5" />
+                  Attach voice sample
+                </>
+              )}
+            </button>
+          )}
+          {voiceError && <p className="text-[11px] text-red-400">{voiceError}</p>}
         </div>
       )}
     </div>

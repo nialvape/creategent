@@ -122,7 +122,7 @@ export default function HomePage() {
                   </span>
                 )}
               </div>
-              <ProjectSettingsForm settings={settings} onChange={handleSettingsChange} />
+              <ProjectSettingsForm settings={settings} onChange={handleSettingsChange} context="base" />
             </div>
           )}
 

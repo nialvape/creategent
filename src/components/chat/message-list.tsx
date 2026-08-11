@@ -1,10 +1,21 @@
 'use client'
 
 import { useRef, useEffect, useState } from 'react'
+import { Music } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ContentPlanCard } from './content-plan-card'
 import type { ContentPlan } from '@/types/plan'
 import type { GraphStatus } from '@/types/graph-state'
+
+export type AttachmentKind = 'image' | 'video' | 'audio'
+
+export interface MessageAttachment {
+  url: string
+  kind: AttachmentKind
+  name: string
+  /** MIME type, needed by the agent's understanding sub-agents for audio/video. */
+  mimeType?: string
+}
 
 export interface ChatMessage {
   id: string
@@ -13,6 +24,7 @@ export interface ChatMessage {
   plan?: ContentPlan
   estimatedCost?: number
   interrupted?: boolean
+  attachments?: MessageAttachment[]
 }
 
 // Maps graph node names to friendly labels. The supervisor emits full,
@@ -99,6 +111,30 @@ function useTypewriter(target: string) {
   return displayed
 }
 
+function MessageAttachmentThumb({ attachment }: { attachment: MessageAttachment }) {
+  const { url, kind, name } = attachment
+  if (kind === 'audio') {
+    return (
+      <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-3 py-2 max-w-[16rem]">
+        <Music className="h-4 w-4 flex-shrink-0 text-indigo-300" />
+        <audio src={url} controls className="h-8 max-w-[12rem]" />
+      </div>
+    )
+  }
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer" title={name}>
+      <div className="h-24 w-24 overflow-hidden rounded-xl border border-white/15 bg-white/5">
+        {kind === 'image' ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={url} alt={name} className="h-full w-full object-cover" />
+        ) : (
+          <video src={url} muted playsInline preload="metadata" className="h-full w-full object-cover" />
+        )}
+      </div>
+    </a>
+  )
+}
+
 interface MessageListProps {
   messages: ChatMessage[]
   onApprove: () => void
@@ -173,10 +209,19 @@ export function MessageList({ messages, onApprove, onReject, isStreaming, disabl
               )}
             </div>
           ) : (
-            <div className="max-w-lg">
-              <div className="bg-indigo-600/80 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm">
-                {msg.content}
-              </div>
+            <div className="max-w-lg flex flex-col items-end gap-1.5">
+              {msg.attachments && msg.attachments.length > 0 && (
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  {msg.attachments.map((att, i) => (
+                    <MessageAttachmentThumb key={`${att.url}-${i}`} attachment={att} />
+                  ))}
+                </div>
+              )}
+              {msg.content && (
+                <div className="bg-indigo-600/80 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm">
+                  {msg.content}
+                </div>
+              )}
             </div>
           )}
         </div>

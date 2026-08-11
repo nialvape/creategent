@@ -4,7 +4,7 @@ import type { ContentPlan, ContentType, PlanStatus } from '@/types/plan'
 import type { Asset } from '@/types/asset'
 import type { AssetBrief } from '@/types/director'
 import type { ProjectSettings } from '@/types/project'
-import type { GraphStatus, GenerationProgress, ReviewResult } from '@/types/graph-state'
+import type { GraphStatus, GenerationProgress, ReviewResult, ReferenceMedium } from '@/types/graph-state'
 
 function last<T>(a: T, b: T): T { return b }
 
@@ -30,6 +30,13 @@ const defaultSettings: ProjectSettings = {
 
 /** Default free OpenRouter model for the cheap plan-translation step. */
 export const DEFAULT_TRANSLATION_MODEL = 'meta-llama/llama-3.3-70b-instruct:free'
+
+/**
+ * Multimodal model used by the reference-media understanding sub-agents. Gemini
+ * 2.5 Flash accepts image, audio AND video inputs, so one model covers all three
+ * file kinds the user can attach.
+ */
+export const DEFAULT_MEDIA_UNDERSTANDING_MODEL = 'google/gemini-2.5-flash'
 
 /** Resolve orchestration model, falling back to legacy preferredLLM for old projects */
 export function getOrchestrationModel(settings: ProjectSettings): string {
@@ -80,4 +87,6 @@ export const ContentState = Annotation.Root({
     reducer: (a, b) => [...a, ...b],
     default: () => [],
   }),
+  // User-attached reference files, enriched with descriptions by the intake node.
+  referenceMedia: Annotation<ReferenceMedium[]>({ reducer: last, default: () => [] }),
 })

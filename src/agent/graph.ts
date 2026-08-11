@@ -1,6 +1,7 @@
 import { StateGraph, START, END, type LangGraphRunnableConfig } from '@langchain/langgraph'
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres'
 import { ContentState } from './state'
+import { referenceIntakeNode } from './nodes/reference-intake'
 import { plannerNode } from './nodes/planner'
 import { humanApprovalNode } from './nodes/human-approval'
 import { supervisorNode } from './nodes/supervisor'
@@ -42,10 +43,14 @@ function routeAfterApproval(state: typeof ContentState.State): string {
 // output, issues per-asset corrections, and finally produces the holistic review.
 function buildGraph(checkpointer: PostgresSaver) {
   const graph = new StateGraph(ContentState)
+    .addNode('reference_intake', loggedNode('reference_intake', referenceIntakeNode))
     .addNode('planner', loggedNode('planner', plannerNode))
     .addNode('await_approval', loggedNode('await_approval', humanApprovalNode))
     .addNode('supervisor', loggedNode('supervisor', supervisorNode))
-    .addEdge(START, 'planner')
+    // Understand any attached reference files first, then plan. The re-plan loop
+    // (await_approval → planner) skips intake — descriptions already persist.
+    .addEdge(START, 'reference_intake')
+    .addEdge('reference_intake', 'planner')
     .addEdge('planner', 'await_approval')
     .addConditionalEdges('await_approval', routeAfterApproval, {
       supervisor: 'supervisor',

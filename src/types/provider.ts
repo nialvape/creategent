@@ -63,6 +63,21 @@ export interface LLMProvider {
     schema: unknown
     systemPrompt?: string
   }): Promise<GenerationResult<T>>
+
+  /**
+   * Multimodal understanding: send a media file (image, video or audio) by URL to
+   * a vision/audio-capable model and get a natural-language description back. Used
+   * by the reference-media intake sub-agents.
+   */
+  describeMedia(params: {
+    url: string
+    /** MIME type, e.g. "image/png", "video/mp4", "audio/mpeg". */
+    mediaType: string
+    kind: 'image' | 'video' | 'audio'
+    prompt: string
+    model: string
+    systemPrompt?: string
+  }): Promise<GenerationResult<string>>
 }
 
 export interface AudioProvider {

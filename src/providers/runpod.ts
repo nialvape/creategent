@@ -26,13 +26,15 @@ const RUNPOD_BASE = 'https://api.runpod.ai/v2'
 const ENDPOINTS: Record<string, { envKey: string; defaultId: string; gpuUsdPerSec: number }> = {
   'runpod/wan-2.6-i2v': {
     envKey: 'RUNPOD_WAN_ENDPOINT_ID',
-    defaultId: '0urbbihiwowt7f',
+    // US-CA-2 — the only datacenter that has both H100 stock and network-volume
+    // support, and the weights volume (creategent-models) lives there.
+    defaultId: 'vnnxonpsh1y7r8',
     gpuUsdPerSec: 0.00116, // ~H100 80GB serverless flex
   },
   'runpod/chatterbox': {
     envKey: 'RUNPOD_CHATTERBOX_ENDPOINT_ID',
-    defaultId: '09bw6q1blhayzg',
-    gpuUsdPerSec: 0.00044, // ~RTX 5090
+    defaultId: 'ihl391rbv6ihr7',
+    gpuUsdPerSec: 0.00016, // ~16GB-tier GPU (RTX 4090)
   },
   'runpod/musetalk': {
     envKey: 'RUNPOD_MUSETALK_ENDPOINT_ID',

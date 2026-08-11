@@ -36,7 +36,12 @@ export function ProjectSettingsModal({ project, open, onClose, onSave }: Project
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto pr-1 -mr-1">
-          <ProjectSettingsForm settings={settings} onChange={setSettings} />
+          <ProjectSettingsForm
+            settings={settings}
+            onChange={setSettings}
+            context="project"
+            projectId={project.id}
+          />
         </div>
 
         <div className="flex gap-2 pt-4 flex-shrink-0 border-t border-white/8 mt-4">

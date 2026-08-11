@@ -98,6 +98,45 @@ export class OpenRouterAdapter implements LLMProvider {
     }
   }
 
+  async describeMedia(params: {
+    url: string
+    mediaType: string
+    kind: 'image' | 'video' | 'audio'
+    prompt: string
+    model: string
+    systemPrompt?: string
+  }): Promise<GenerationResult<string>> {
+    const model = resolveModel(params.model)
+    console.log(`[llm] describeMedia: model=${model} kind=${params.kind}`)
+    // Images map to an image part; audio/video map to a file part with their MIME
+    // type. The AI SDK forwards the URL to OpenRouter, which fetches the bytes.
+    const mediaPart =
+      params.kind === 'image'
+        ? { type: 'image' as const, image: new URL(params.url) }
+        : { type: 'file' as const, data: new URL(params.url), mediaType: params.mediaType }
+    try {
+      const result = await generateText({
+        model: this.client(model),
+        system: params.systemPrompt,
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: params.prompt }, mediaPart],
+          },
+        ],
+        maxOutputTokens: 1024,
+      })
+
+      const cost = this.extractCost(result)
+      console.log(`[llm] describeMedia: done model=${model} cost=$${cost}`)
+
+      return { data: result.text, cost, model, provider: 'openrouter' }
+    } catch (err) {
+      console.error(`[llm] describeMedia: FAILED model=${model} kind=${params.kind} —`, err instanceof Error ? err.message : err)
+      throw err
+    }
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private extractCost(result: any): number {
     try {

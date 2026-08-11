@@ -1,6 +1,7 @@
 import { getGraph, getGraphState } from '@/agent/graph'
 import { iterateGraphEvents } from '@/lib/stream-adapter'
 import type { ProjectSettings } from '@/types/project'
+import type { ReferenceMedium } from '@/types/graph-state'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -26,12 +27,14 @@ export async function POST(req: Request) {
       projectId,
       projectSettings,
       command,
+      attachments,
     }: {
       messages?: Array<{ role: string; content: string }>
       threadId: string
       projectId: string
       projectSettings?: ProjectSettings
       command?: { type: 'approve' | 'reject'; feedback?: string }
+      attachments?: ReferenceMedium[]
     } = body
 
     const graph = await getGraph()
@@ -66,6 +69,11 @@ export async function POST(req: Request) {
           projectSettings: defaultSettings,
           messages: [{ role: 'user', content: userIdea }],
           status: 'planning',
+          // Attached reference files. The intake node describes each before the
+          // planner runs. Sanitized to the fields the graph needs.
+          referenceMedia: (attachments ?? [])
+            .filter((a) => a && a.url && a.kind)
+            .map((a) => ({ url: a.url, kind: a.kind, name: a.name ?? '', mimeType: a.mimeType ?? '' })),
         },
       }
     }

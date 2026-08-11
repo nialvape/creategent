@@ -45,3 +45,4 @@ gen*.txt
 plan*.txt
 pid*.txt
 proj*.json
+*.wav

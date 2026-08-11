@@ -17,6 +17,20 @@ export interface ReviewResult {
   retryCount: number
 }
 
+/**
+ * A media file the user attached to the conversation. A per-type understanding
+ * sub-agent (see reference-intake node) fills in `description`; the planner then
+ * reasons about each file's PURPOSE for the project.
+ */
+export interface ReferenceMedium {
+  url: string
+  kind: 'image' | 'video' | 'audio'
+  name: string
+  mimeType: string
+  /** Natural-language description produced by the understanding sub-agent. */
+  description?: string
+}
+
 export type GraphStatus =
   | 'idle'
   | 'planning'
@@ -41,4 +55,5 @@ export interface ContentGraphState {
   reviewResult: ReviewResult | null
   status: GraphStatus
   errors: string[]
+  referenceMedia: ReferenceMedium[]
 }
