@@ -158,6 +158,69 @@ export const AVATAR_MODELS: ModelDef[] = [
   },
 ]
 
+// Multimodal models that can READ an attached file (the reference-intake step —
+// see agent/nodes/reference-intake.ts). Which file kinds a model can actually
+// ingest varies a lot: only Gemini takes video and audio, so `supports` gates
+// what the model lab will send it.
+export interface UnderstandingModelDef extends ModelDef {
+  supports: Array<'image' | 'video' | 'audio'>
+}
+
+export const UNDERSTANDING_MODELS: UnderstandingModelDef[] = [
+  {
+    id: 'google/gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    provider: 'Google',
+    description: 'Current intake default. Reads image, video AND audio — one model covers every attachment.',
+    tags: ['recommended'],
+    priceLabel: '$0.0003/1k tokens',
+    supports: ['image', 'video', 'audio'],
+  },
+  {
+    id: 'google/gemini-2.5-pro',
+    name: 'Gemini 2.5 Pro',
+    provider: 'Google',
+    description: 'Same multimodal reach as Flash with deeper reasoning. Slower and pricier.',
+    tags: ['best quality'],
+    priceLabel: '$0.0025/1k tokens',
+    supports: ['image', 'video', 'audio'],
+  },
+  {
+    id: 'google/gemini-2.5-flash-lite',
+    name: 'Gemini 2.5 Flash Lite',
+    provider: 'Google',
+    description: 'Cheapest multimodal option. Good for checking how far quality drops on intake.',
+    tags: ['fastest', 'cheapest'],
+    priceLabel: '$0.0001/1k tokens',
+    supports: ['image', 'video', 'audio'],
+  },
+  {
+    id: 'openai/gpt-4o',
+    name: 'GPT-4o',
+    provider: 'OpenAI',
+    description: 'Strong image reading and text extraction. No video or audio input.',
+    priceLabel: '$0.0025/1k tokens',
+    supports: ['image'],
+  },
+  {
+    id: 'anthropic/claude-sonnet-4-5',
+    name: 'Claude Sonnet 4.5',
+    provider: 'Anthropic',
+    description: 'Very precise on composition, style and on-image text. Images only.',
+    priceLabel: '$0.003/1k tokens',
+    supports: ['image'],
+  },
+  {
+    id: 'qwen/qwen2.5-vl-72b-instruct',
+    name: 'Qwen2.5-VL 72B',
+    provider: 'Alibaba',
+    description: 'Open-weight vision model at a fraction of the price. Images only.',
+    tags: ['cheapest'],
+    priceLabel: '$0.0002/1k tokens',
+    supports: ['image'],
+  },
+]
+
 export const AUDIO_MODELS: ModelDef[] = [
   {
     id: 'runpod/chatterbox',

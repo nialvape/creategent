@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Plus, FolderOpen, Sparkles } from 'lucide-react'
+import { Plus, FolderOpen, Sparkles, FlaskConical } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { loadDefaultSettings } from '@/lib/default-settings'
 import type { Project } from '@/types/project'
@@ -115,6 +115,17 @@ export function ProjectSidebar() {
             </div>
           ))
         )}
+      </div>
+
+      {/* Model lab */}
+      <div className="border-t border-white/10 px-2 py-2">
+        <button
+          onClick={() => router.push('/testing')}
+          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs text-white/60 transition-colors hover:bg-white/5 hover:text-white"
+        >
+          <FlaskConical className="h-3.5 w-3.5 flex-shrink-0 opacity-60" />
+          Model Lab
+        </button>
       </div>
     </aside>
   )

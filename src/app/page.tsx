@@ -4,7 +4,8 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Plus, Folder, ArrowRight, Zap, Settings2, ChevronDown, ChevronUp, Check } from 'lucide-react'
+import Link from 'next/link'
+import { Plus, Folder, ArrowRight, Zap, Settings2, ChevronDown, ChevronUp, Check, FlaskConical } from 'lucide-react'
 import type { Project, ProjectSettings } from '@/types/project'
 import { ProjectSettingsForm } from '@/components/project/project-settings-form'
 import { DeleteProjectDialog } from '@/components/project/delete-project-dialog'
@@ -71,6 +72,13 @@ export default function HomePage() {
       {/* Hero */}
       <div className="relative border-b border-white/10 px-6 py-16 text-center overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-b from-indigo-500/10 via-transparent to-transparent pointer-events-none" />
+        <Link
+          href="/testing"
+          className="absolute right-6 top-5 z-10 flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-white/50 transition-colors hover:border-white/20 hover:text-white"
+        >
+          <FlaskConical className="h-3.5 w-3.5" />
+          Model Lab
+        </Link>
         <div className="relative max-w-2xl mx-auto space-y-4">
           <div className="flex justify-center">
             <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/20 border border-indigo-500/30 text-indigo-300 text-xs">
