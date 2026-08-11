@@ -13,11 +13,16 @@
 #   handler (it already speaks the workflow-JSON contract) and pull ComfyUI to
 #   master on top.
 #
-# Base tag note: deliberately NOT the -cuda12.8.1 variant. A CUDA 12.8 base is
-# what broke the earlier chatterbox/wan workers at container start
-# ("nvidia-container-cli: unsatisfied condition: cuda>=12.8" on older-driver
-# hosts). Keep the default base unless the whole fleet is verified on 12.8.
-FROM runpod/worker-comfyui:5.8.6-base
+# Base tag note: this worker MUST use the -cuda12.8.1 variant, which is the
+# opposite of the rule chatterbox/wan follow. The default 5.8.6-base ships CUDA
+# 12.6.3 (NVIDIA_REQUIRE_CUDA=cuda>=12.6), and Blackwell (sm_120) needs 12.8+,
+# so the RTX PRO 6000 this endpoint targets cannot initialize on it.
+#
+# chatterbox/wan avoid a 12.8 base because it fails at container start on
+# older-driver hosts ("nvidia-container-cli: unsatisfied condition: cuda>=12.8").
+# That failure mode cannot reach this worker: the endpoint is pinned to the
+# BLACKWELL_96 pool, and every Blackwell host has a driver new enough for 12.8.
+FROM runpod/worker-comfyui:5.8.6-base-cuda12.8.1
 
 # COMFYUI_PATH is where the base image keeps its ComfyUI checkout. If a future
 # base tag moves it, this is the one line to change.
