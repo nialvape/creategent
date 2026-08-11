@@ -1,0 +1,14 @@
+# Points ComfyUI at the RunPod network volume instead of its in-image models dir.
+#
+# On a serverless worker the volume mounts at /runpod-volume; on a pod (which is
+# how you populate it) the same volume mounts at /workspace. Download into
+# /workspace/models/... and the paths below line up at runtime.
+runpod_volume:
+  base_path: /runpod-volume/
+  diffusion_models: models/diffusion_models/
+  text_encoders: models/text_encoders/
+  vae: models/vae/
+  loras: models/loras/
+  clip: models/clip/
+  clip_vision: models/clip_vision/
+  checkpoints: models/checkpoints/
