@@ -16,12 +16,31 @@ export interface LabFile {
   kind: 'image' | 'video' | 'audio'
 }
 
+/**
+ * Video knobs the bench exposes. `aspectRatio: 'auto'` is resolved in the
+ * browser from the attached image's real dimensions before the request is sent,
+ * because the workflow takes its size from these settings and NOT from the
+ * image — a portrait frame under a landscape ratio comes out stretched.
+ */
+export interface LabVideoParams {
+  aspectRatio: string | 'auto'
+  megapixels: number
+  durationSec: number
+  fps: number
+  /** Empty means "random per run". */
+  seed?: number
+  enhancePrompt: boolean
+  negativePrompt: string
+}
+
 export interface LabRunRequest {
   capability: LabCapability
   model: string
   /** The text half of the input: a prompt, a script, or intake instructions. */
   prompt: string
   files: LabFile[]
+  /** Only sent for the `video` capability. */
+  videoParams?: LabVideoParams
 }
 
 /** One piece of model output. A run can produce several (one per input file). */

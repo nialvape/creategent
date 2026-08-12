@@ -1,18 +1,35 @@
 import { withRetry } from '@/lib/retry'
+import {
+  buildLtxI2vWorkflow,
+  resolveDimensions,
+  frameCount,
+  LTX_DEFAULTS,
+  type LtxAspectRatio,
+} from '@/lib/comfy/ltx-2-5-i2v'
 import type {
   MediaProvider,
   AudioProvider,
   GenerationResult,
+  VideoOptions,
 } from '@/types/provider'
 
 /**
  * RunPod Serverless adapter. The user hosts their own GPU models on RunPod
- * serverless endpoints (wan 2.6 image-to-video, Chatterbox TTS, MuseTalk avatar)
- * loaded from a network volume. Each endpoint exposes a tiny JSON handler:
+ * serverless endpoints loaded from a network volume. Two handler protocols are
+ * in play, which is what `kind` below distinguishes:
  *
- *   wan i2v     in  { prompt, image_url, width, height, duration } -> { video_b64 }
- *   chatterbox  in  { text, reference_audio_b64? }                 -> { audio_b64, sample_rate }
- *   musetalk    in  { image_url, audio_b64 }                       -> { video_b64 }   (handler not deployed yet)
+ *   kind 'simple' — a purpose-built handler with a flat JSON contract:
+ *     wan i2v     in  { prompt, image_url, width, height, duration } -> { video_b64 }
+ *     chatterbox  in  { text, reference_audio_b64? }                 -> { audio_b64, sample_rate }
+ *     musetalk    in  { image_url, audio_b64 }                       -> { video_b64 }
+ *
+ *   kind 'comfy' — the stock runpod/worker-comfyui handler, which takes an
+ *     entire ComfyUI API-format graph:
+ *       in  { workflow, images: [{ name, image }] }
+ *       out { images: [{ filename, type: 'base64', data }] }
+ *     Note the output key is `images` even for video: ComfyUI's SaveVideo
+ *     reports through PreviewVideo, which writes under "images". The mp4 comes
+ *     back base64 in `data` with an .mp4 filename.
  *
  * Endpoints are async: POST /run returns a job id, then we poll /status/{id}
  * until COMPLETED. Cost is billed per GPU-second, so we derive actual_cost from
@@ -21,25 +38,47 @@ import type {
 
 const RUNPOD_BASE = 'https://api.runpod.ai/v2'
 
+interface EndpointDef {
+  envKey: string
+  defaultId: string
+  gpuUsdPerSec: number
+  kind: 'simple' | 'comfy'
+}
+
 // Model id -> serverless endpoint id. Overridable via env so the ids aren't
 // baked into source (the defaults are the user's current endpoints).
-const ENDPOINTS: Record<string, { envKey: string; defaultId: string; gpuUsdPerSec: number }> = {
+const ENDPOINTS: Record<string, EndpointDef> = {
+  'runpod/ltx-2.5-i2v': {
+    envKey: 'RUNPOD_COMFYUI_ENDPOINT_ID',
+    // EUR-IS-1, pool ADA_32_PRO, weights on creategent-models-is1.
+    defaultId: 'z8tadmgfo6gdvs',
+    // RTX 5090 at $0.99/hr. The endpoint is pinned to that single pool on
+    // purpose: with BLACKWELL_96 also allowed, RunPod kept picking the RTX PRO
+    // 6000 at $2.09/hr. Re-add that pool only alongside a rate change here.
+    gpuUsdPerSec: 0.000275,
+    kind: 'comfy',
+  },
   'runpod/wan-2.6-i2v': {
     envKey: 'RUNPOD_WAN_ENDPOINT_ID',
-    // US-CA-2 — the only datacenter that has both H100 stock and network-volume
-    // support, and the weights volume (creategent-models) lives there.
+    // NOTE: this endpoint no longer exists — it was torn down along with the
+    // US-NE-1 volume. Set RUNPOD_WAN_ENDPOINT_ID to a live one before using
+    // this model, or it will fail with a 404 from /run.
     defaultId: 'vnnxonpsh1y7r8',
     gpuUsdPerSec: 0.00116, // ~H100 80GB serverless flex
+    kind: 'simple',
   },
   'runpod/chatterbox': {
     envKey: 'RUNPOD_CHATTERBOX_ENDPOINT_ID',
     defaultId: 'ihl391rbv6ihr7',
     gpuUsdPerSec: 0.00016, // ~16GB-tier GPU (RTX 4090)
+    kind: 'simple',
   },
   'runpod/musetalk': {
     envKey: 'RUNPOD_MUSETALK_ENDPOINT_ID',
+    // NOTE: never deployed — no endpoint with this id exists on the account.
     defaultId: 'ebkllrlml5kij3',
     gpuUsdPerSec: 0.00031, // ~RTX 4090
+    kind: 'simple',
   },
 }
 
@@ -48,11 +87,11 @@ export function isRunPodModel(model: string | undefined | null): boolean {
   return !!model && model.startsWith('runpod/')
 }
 
-function endpointFor(model: string): { id: string; gpuUsdPerSec: number } {
+function endpointFor(model: string): { id: string; gpuUsdPerSec: number; kind: EndpointDef['kind'] } {
   const def = ENDPOINTS[model]
   if (!def) throw new Error(`Unknown RunPod model "${model}"`)
   const id = process.env[def.envKey] || def.defaultId
-  return { id, gpuUsdPerSec: def.gpuUsdPerSec }
+  return { id, gpuUsdPerSec: def.gpuUsdPerSec, kind: def.kind }
 }
 
 interface RunStatus {
@@ -130,8 +169,11 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     duration: number
     format?: string
     maxAttempts?: number
+    options?: VideoOptions
   }): Promise<GenerationResult> {
-    const { id, gpuUsdPerSec } = endpointFor(params.model)
+    const { id, gpuUsdPerSec, kind } = endpointFor(params.model)
+    if (kind === 'comfy') return this.generateVideoViaComfy(params, id, gpuUsdPerSec)
+
     return withRetry(async () => {
       const { output, executionMs } = await this.runJob(id, {
         prompt: params.prompt,
@@ -150,6 +192,87 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
         metadata: { executionMs },
       }
     }, params.maxAttempts ?? 2)
+  }
+
+  /**
+   * Video through the stock worker-comfyui handler: send the whole graph plus
+   * the first frame inline, get an mp4 back base64. Not retried by default —
+   * a run costs minutes of GPU time, so a silent second attempt would double a
+   * real bill to work around what is usually a deterministic graph error.
+   */
+  private async generateVideoViaComfy(
+    params: {
+      prompt: string
+      model: string
+      imageUrl: string
+      duration: number
+      maxAttempts?: number
+      options?: VideoOptions
+    },
+    endpointId: string,
+    gpuUsdPerSec: number
+  ): Promise<GenerationResult> {
+    const opts = params.options ?? {}
+    const aspectRatio = (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)'
+    const megapixels = opts.megapixels ?? LTX_DEFAULTS.megapixels
+    const fps = opts.fps ?? LTX_DEFAULTS.fps
+
+    const imageName = 'first_frame.png'
+    const workflow = buildLtxI2vWorkflow({
+      prompt: params.prompt,
+      imageName,
+      aspectRatio,
+      megapixels,
+      durationSec: params.duration,
+      fps,
+      seed: opts.seed,
+      enhancePrompt: opts.enhancePrompt ?? LTX_DEFAULTS.enhancePrompt,
+      negativePrompt: opts.negativePrompt ?? LTX_DEFAULTS.negativePrompt,
+    })
+
+    const imageB64 = await fetchAsBase64(params.imageUrl)
+
+    return withRetry(async () => {
+      const { output, executionMs } = await this.runJob(
+        endpointId,
+        { workflow, images: [{ name: imageName, image: imageB64 }] },
+        // Two sampling stages plus a tiled VAE decode: minutes, not seconds.
+        { timeoutMs: 25 * 60_000, pollMs: 5_000 }
+      )
+
+      // Non-fatal problems (a failed S3 upload, a dropped output) arrive here
+      // rather than as a job failure — surface them instead of silently
+      // returning an empty result.
+      const errors = output.errors as string[] | undefined
+
+      const images = output.images as Array<{ filename?: string; type?: string; data?: string }> | undefined
+      const video = images?.find((i) => i.filename?.toLowerCase().endsWith('.mp4')) ?? images?.[0]
+      if (!video?.data) {
+        throw new Error(
+          `ComfyUI returned no video${errors?.length ? `: ${errors.join('; ')}` : ''}`
+        )
+      }
+
+      const { width, height } = resolveDimensions(aspectRatio, megapixels)
+      return {
+        // s3_url means the worker has S3 configured; otherwise it's raw base64.
+        url: video.type === 's3_url' ? video.data : `data:video/mp4;base64,${video.data}`,
+        cost: (executionMs / 1000) * gpuUsdPerSec,
+        model: params.model,
+        provider: 'runpod',
+        metadata: {
+          executionMs,
+          filename: video.filename,
+          width,
+          height,
+          frames: frameCount(params.duration, fps),
+          aspectRatio,
+          megapixels,
+          fps,
+          errors,
+        },
+      }
+    }, params.maxAttempts ?? 1)
   }
 
   async generateAvatarVideo(params: {

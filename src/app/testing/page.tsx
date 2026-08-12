@@ -7,6 +7,9 @@ import { Button } from '@/components/ui/button'
 import { ModelPicker } from '@/components/ui/model-picker'
 import { LabFilePicker, type LabAttachment } from '@/components/testing/lab-file-picker'
 import { LabRunCard, type LabRunRecord } from '@/components/testing/lab-run-card'
+import { VideoParamsPanel } from '@/components/testing/video-params'
+import { RunPodCredits } from '@/components/testing/runpod-credits'
+import { LTX_DEFAULTS, aspectRatioForSize } from '@/lib/comfy/ltx-2-5-i2v'
 import {
   UNDERSTANDING_MODELS,
   IMAGE_MODELS,
@@ -15,11 +18,35 @@ import {
   AUDIO_MODELS,
   type ModelDef,
 } from '@/lib/models'
-import type { LabCapability, LabFile, LabRunResult } from '@/types/testing'
+import type { LabCapability, LabFile, LabRunResult, LabVideoParams } from '@/types/testing'
 import { cn } from '@/lib/utils'
 
 /** Storage prefix for lab uploads — mirrors LAB_PROJECT_ID on the server. */
 const LAB_PROJECT_ID = 'model-lab'
+
+const DEFAULT_VIDEO_PARAMS: LabVideoParams = {
+  aspectRatio: 'auto',
+  megapixels: LTX_DEFAULTS.megapixels,
+  durationSec: LTX_DEFAULTS.durationSec,
+  fps: LTX_DEFAULTS.fps,
+  enhancePrompt: LTX_DEFAULTS.enhancePrompt,
+  negativePrompt: LTX_DEFAULTS.negativePrompt,
+}
+
+/**
+ * Turns `aspectRatio: 'auto'` into a concrete ratio using the attached image's
+ * real proportions. Done here rather than on the server because only the
+ * browser has the decoded image — and the workflow takes its output size from
+ * this setting, not from the image, so guessing would stretch the frame.
+ */
+function resolveAutoAspect(objectUrl: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => resolve(aspectRatioForSize(img.naturalWidth, img.naturalHeight))
+    img.onerror = () => resolve(null)
+    img.src = objectUrl
+  })
+}
 
 interface CapabilityGroup {
   capability: LabCapability
@@ -81,6 +108,9 @@ export default function ModelLabPage() {
   const [runs, setRuns] = useState<LabRunRecord[]>([])
   const [busy, setBusy] = useState(false)
   const [inputError, setInputError] = useState<string | null>(null)
+  const [videoParams, setVideoParams] = useState<LabVideoParams>(DEFAULT_VIDEO_PARAMS)
+  // Bumped after each run so the balance reflects what the run just cost.
+  const [creditsKey, setCreditsKey] = useState(0)
 
   // Uploaded URL per attachment, so running the same files against a second
   // model re-uses the upload instead of paying for it again.
@@ -143,11 +173,32 @@ export default function ModelLabPage() {
     setRuns((prev) => [record, ...prev])
 
     try {
+      let params: LabVideoParams | undefined
+      if (capability === 'video') {
+        params = { ...videoParams }
+        if (params.aspectRatio === 'auto') {
+          const firstImage = attachments.find((a) => a.kind === 'image')
+          const resolved = firstImage ? await resolveAutoAspect(firstImage.url) : null
+          if (!resolved) {
+            setInputError('Attach a first-frame image, or pick an aspect ratio explicitly.')
+            setRuns((prev) => prev.filter((r) => r.id !== record.id))
+            return
+          }
+          params.aspectRatio = resolved
+        }
+      }
+
       const files = await uploadAll()
       const res = await fetch('/api/testing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ capability, model, prompt: prompt.trim(), files }),
+        body: JSON.stringify({
+          capability,
+          model,
+          prompt: prompt.trim(),
+          files,
+          videoParams: params,
+        }),
       })
       const data = await res.json()
 
@@ -172,6 +223,7 @@ export default function ModelLabPage() {
       )
     } finally {
       setBusy(false)
+      setCreditsKey((k) => k + 1)
     }
   }
 
@@ -192,9 +244,12 @@ export default function ModelLabPage() {
             <FlaskConical className="h-4 w-4 text-indigo-400" />
             <h1 className="text-sm font-semibold text-white">Model Lab</h1>
           </div>
-          <p className="ml-auto hidden text-xs text-white/30 sm:block">
-            One model, raw input, no graph — compare before wiring it into the agent.
-          </p>
+          <div className="ml-auto flex items-center gap-3">
+            <p className="hidden text-xs text-white/30 lg:block">
+              One model, raw input, no graph — compare before wiring it into the agent.
+            </p>
+            <RunPodCredits refreshKey={creditsKey} />
+          </div>
         </div>
       </div>
 
@@ -238,6 +293,16 @@ export default function ModelLabPage() {
               </p>
             )}
           </section>
+
+          {/* Video knobs — only this capability has settings worth exposing. */}
+          {capability === 'video' && (
+            <VideoParamsPanel
+              value={videoParams}
+              onChange={setVideoParams}
+              imageUrl={attachments.find((a) => a.kind === 'image')?.url}
+              disabled={busy}
+            />
+          )}
 
           {/* Text */}
           <section className="space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] p-4">

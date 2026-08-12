@@ -13,6 +13,24 @@ export interface ProviderConfig {
   timeout?: number
 }
 
+/**
+ * Generation settings for the self-hosted ComfyUI video endpoints, where the
+ * workflow exposes more than a width/height/duration triple. Every field is
+ * optional so callers that don't care get the workflow's own defaults.
+ */
+export interface VideoOptions {
+  /** ComfyUI ResolutionSelector ratio, e.g. "9:16 (Portrait Widescreen)". */
+  aspectRatio?: string
+  /** Output megapixels. Combined with aspectRatio this sets the real size. */
+  megapixels?: number
+  fps?: number
+  /** Sampler seed. Omitted means a random one per run. */
+  seed?: number
+  /** Rewrite the prompt with an LLM that can see the first frame. */
+  enhancePrompt?: boolean
+  negativePrompt?: string
+}
+
 export interface MediaProvider {
   generateImage(params: {
     prompt: string
@@ -33,6 +51,11 @@ export interface MediaProvider {
     duration: number
     format?: string
     maxAttempts?: number
+    /**
+     * Knobs only the self-hosted ComfyUI endpoints understand. Hosted providers
+     * (Fal/Kling) take width/height/duration and ignore this.
+     */
+    options?: VideoOptions
   }): Promise<GenerationResult>
 
   /**

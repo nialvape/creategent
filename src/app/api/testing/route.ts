@@ -7,7 +7,18 @@ import {
   VIDEO_UNDERSTANDING_PROMPT,
   AUDIO_UNDERSTANDING_PROMPT,
 } from '@/agent/prompts/reference'
-import type { LabCapability, LabFile, LabOutput, LabRunResult } from '@/types/testing'
+import {
+  resolveDimensions,
+  LTX_DEFAULTS,
+  type LtxAspectRatio,
+} from '@/lib/comfy/ltx-2-5-i2v'
+import type {
+  LabCapability,
+  LabFile,
+  LabOutput,
+  LabRunResult,
+  LabVideoParams,
+} from '@/types/testing'
 
 /** Storage prefix for lab uploads/outputs — keeps bench files out of real projects. */
 export const LAB_PROJECT_ID = 'model-lab'
@@ -90,7 +101,12 @@ async function runImage(model: string, prompt: string): Promise<{ outputs: LabOu
   }
 }
 
-async function runVideo(model: string, prompt: string, files: LabFile[]) {
+async function runVideo(
+  model: string,
+  prompt: string,
+  files: LabFile[],
+  videoParams?: LabVideoParams
+) {
   // The pipeline is image-to-video only (see lib/models.ts VIDEO_MODELS), so a
   // first-frame image is required here too — testing t2v would test nothing the
   // graph can use.
@@ -98,13 +114,39 @@ async function runVideo(model: string, prompt: string, files: LabFile[]) {
   if (!source) throw new BadInput('Video models are image-to-video: attach a first-frame image.')
   if (!prompt.trim()) throw new BadInput('Video generation needs a text prompt describing the motion.')
 
+  const aspectRatio = videoParams?.aspectRatio
+  if (aspectRatio === 'auto') {
+    // The browser resolves 'auto' against the real image size; reaching the
+    // server means that failed, and guessing here would silently stretch the
+    // frame — the exact failure this setting exists to prevent.
+    throw new BadInput('Could not read the image dimensions — pick an aspect ratio explicitly.')
+  }
+
+  const megapixels = videoParams?.megapixels ?? LTX_DEFAULTS.megapixels
+  const duration = videoParams?.durationSec ?? LTX_DEFAULTS.durationSec
+
+  // Hosted providers still take a pixel size, so derive one from the same
+  // settings the ComfyUI graph will use. Keeps both paths on one control set.
+  const { width, height } = resolveDimensions(
+    (aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)',
+    megapixels
+  )
+
   const res = await getMediaProvider(model).generateVideo({
     prompt,
     model,
     imageUrl: source.url,
-    width: 1080,
-    height: 1920,
-    duration: 5,
+    width,
+    height,
+    duration,
+    options: videoParams && {
+      aspectRatio,
+      megapixels,
+      fps: videoParams.fps,
+      seed: videoParams.seed,
+      enhancePrompt: videoParams.enhancePrompt,
+      negativePrompt: videoParams.negativePrompt,
+    },
   })
   return {
     outputs: res.url ? [{ kind: 'video' as const, label: `from ${source.name}`, url: res.url }] : [],
@@ -192,6 +234,7 @@ export async function POST(req: Request) {
       model?: string
       prompt?: string
       files?: LabFile[]
+      videoParams?: LabVideoParams
     }
 
     capability = body.capability ?? 'understanding'
@@ -210,7 +253,7 @@ export async function POST(req: Request) {
         result = await runImage(model, prompt)
         break
       case 'video':
-        result = await runVideo(model, prompt, files)
+        result = await runVideo(model, prompt, files, body.videoParams)
         break
       case 'avatar':
         result = await runAvatar(model, files)

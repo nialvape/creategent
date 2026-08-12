@@ -119,11 +119,19 @@ export const IMAGE_MODELS: ModelDef[] = [
 // pipeline never does text-to-video, so only i2v endpoints belong here.
 export const VIDEO_MODELS: ModelDef[] = [
   {
+    id: 'runpod/ltx-2.5-i2v',
+    name: 'LTX 2.5 distilled (RunPod)',
+    provider: 'RunPod (self-hosted)',
+    description:
+      'Your own GPU. Distilled 11-step image-to-video with synced audio. Measured ~$0.11 for 5s at 0.9MP.',
+    tags: ['recommended', 'cheapest', 'fastest'],
+    priceLabel: '~$0.11/5s',
+  },
+  {
     id: 'runpod/wan-2.6-i2v',
     name: 'Wan 2.6 (RunPod)',
     provider: 'RunPod (self-hosted)',
-    description: 'Your own GPU. Image-to-video on a RunPod serverless endpoint. Billed per GPU-second.',
-    tags: ['recommended', 'cheapest'],
+    description: 'Your own GPU. Image-to-video on a RunPod serverless endpoint. Endpoint is currently torn down.',
     priceLabel: '~GPU/sec',
   },
   {
