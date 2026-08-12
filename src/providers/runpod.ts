@@ -87,6 +87,15 @@ export function isRunPodModel(model: string | undefined | null): boolean {
   return !!model && model.startsWith('runpod/')
 }
 
+/**
+ * Endpoint id backing the self-hosted video model, for status readouts that
+ * need to check worker availability without going through a generation.
+ */
+export function videoEndpointId(): string {
+  const def = ENDPOINTS['runpod/ltx-2.5-i2v']
+  return process.env[def.envKey] || def.defaultId
+}
+
 function endpointFor(model: string): { id: string; gpuUsdPerSec: number; kind: EndpointDef['kind'] } {
   const def = ENDPOINTS[model]
   if (!def) throw new Error(`Unknown RunPod model "${model}"`)
@@ -99,6 +108,49 @@ interface RunStatus {
   output?: Record<string, unknown>
   error?: string
   executionTime?: number // ms of GPU time, present once COMPLETED
+}
+
+interface WorkerCounts {
+  idle?: number
+  initializing?: number
+  ready?: number
+  running?: number
+  throttled?: number
+  unhealthy?: number
+}
+
+/**
+ * How long a job may sit IN_QUEUE before we look at why. Cold starts on these
+ * endpoints legitimately take minutes (the worker pulls a multi-GB image), so
+ * this only needs to be long enough that a worker which *is* coming has been
+ * reported as `initializing`.
+ */
+const QUEUE_DIAGNOSIS_AFTER_MS = 60_000
+
+/**
+ * Turns worker counts into the reason a job is stuck, or null when the queue is
+ * healthy and the caller should keep waiting.
+ *
+ * The distinction matters because the fixes are opposites: throttled/absent
+ * workers mean the endpoint's GPU pool has no capacity in its datacenter (wait,
+ * or widen the pool), while unhealthy ones mean the container itself is
+ * crash-looping and no amount of waiting will help.
+ */
+function diagnoseQueue(w: WorkerCounts): string | null {
+  const unhealthy = w.unhealthy ?? 0
+  const throttled = w.throttled ?? 0
+  const live = (w.idle ?? 0) + (w.ready ?? 0) + (w.running ?? 0) + (w.initializing ?? 0)
+
+  if (unhealthy > 0 && live === 0) {
+    return `the worker is crash-looping (${unhealthy} unhealthy). The container fails before the handler starts — check the worker logs in the RunPod console.`
+  }
+  if (throttled > 0) {
+    return `no GPU capacity (${throttled} worker${throttled > 1 ? 's' : ''} throttled). The endpoint's GPU pool has nothing free in its datacenter right now.`
+  }
+  if (live === 0) {
+    return 'no worker could be allocated. The endpoint\'s GPU pool has no capacity in the datacenter its network volume is pinned to.'
+  }
+  return null
 }
 
 export class RunPodAdapter implements MediaProvider, AudioProvider {
@@ -132,7 +184,9 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
 
     const timeoutMs = opts.timeoutMs ?? 5 * 60_000
     const pollMs = opts.pollMs ?? 3_000
-    const deadline = Date.now() + timeoutMs
+    const startedAt = Date.now()
+    const deadline = startedAt + timeoutMs
+    let diagnosed = false
 
     for (;;) {
       const res = await fetch(`${RUNPOD_BASE}/${endpointId}/status/${id}`, { headers })
@@ -148,10 +202,67 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
       if (body.status === 'FAILED' || body.status === 'CANCELLED' || body.status === 'TIMED_OUT') {
         throw new Error(`RunPod job ${body.status}: ${body.error ?? 'no error detail'}`)
       }
+
+      // A job that never leaves the queue looks identical to a slow one until
+      // the timeout fires. Ask the endpoint why once, early, so the caller gets
+      // "no GPU capacity" in a minute instead of a bare timeout in 25.
+      if (
+        !diagnosed &&
+        body.status === 'IN_QUEUE' &&
+        Date.now() - startedAt > QUEUE_DIAGNOSIS_AFTER_MS
+      ) {
+        diagnosed = true
+        const workers = await this.workerCounts(endpointId)
+        const reason = workers && diagnoseQueue(workers)
+        if (reason) {
+          await this.cancelJob(endpointId, id)
+          throw new Error(`RunPod endpoint can't run this job: ${reason}`)
+        }
+      }
+
       if (Date.now() > deadline) {
-        throw new Error(`RunPod job timed out after ${Math.round(timeoutMs / 1000)}s (status: ${body.status})`)
+        const workers = await this.workerCounts(endpointId)
+        const detail = workers
+          ? ` Workers: ${JSON.stringify(workers)}.`
+          : ''
+        await this.cancelJob(endpointId, id)
+        throw new Error(
+          `RunPod job timed out after ${Math.round(timeoutMs / 1000)}s while ${body.status}.${detail}`
+        )
       }
       await new Promise((r) => setTimeout(r, pollMs))
+    }
+  }
+
+  /** Worker counts for an endpoint, or null if /health can't be read. */
+  private async workerCounts(endpointId: string): Promise<WorkerCounts | null> {
+    try {
+      const res = await fetch(`${RUNPOD_BASE}/${endpointId}/health`, {
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        cache: 'no-store',
+      })
+      if (!res.ok) return null
+      const body = (await res.json()) as { workers?: WorkerCounts }
+      return body.workers ?? null
+    } catch {
+      // Diagnostics must never be the thing that fails a run.
+      return null
+    }
+  }
+
+  /**
+   * Drops a job we've stopped waiting for. Without this an abandoned job stays
+   * queued and can still be picked up later, burning GPU time for a result
+   * nobody reads.
+   */
+  private async cancelJob(endpointId: string, jobId: string): Promise<void> {
+    try {
+      await fetch(`${RUNPOD_BASE}/${endpointId}/cancel/${jobId}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+      })
+    } catch {
+      // Best effort — the caller is already failing for a better reason.
     }
   }
 

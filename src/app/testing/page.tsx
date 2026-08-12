@@ -8,7 +8,7 @@ import { ModelPicker } from '@/components/ui/model-picker'
 import { LabFilePicker, type LabAttachment } from '@/components/testing/lab-file-picker'
 import { LabRunCard, type LabRunRecord } from '@/components/testing/lab-run-card'
 import { VideoParamsPanel } from '@/components/testing/video-params'
-import { RunPodCredits } from '@/components/testing/runpod-credits'
+import { RunPodStatus } from '@/components/testing/runpod-status'
 import { LTX_DEFAULTS, aspectRatioForSize } from '@/lib/comfy/ltx-2-5-i2v'
 import {
   UNDERSTANDING_MODELS,
@@ -248,7 +248,7 @@ export default function ModelLabPage() {
             <p className="hidden text-xs text-white/30 lg:block">
               One model, raw input, no graph — compare before wiring it into the agent.
             </p>
-            <RunPodCredits refreshKey={creditsKey} />
+            <RunPodStatus refreshKey={creditsKey} />
           </div>
         </div>
       </div>
