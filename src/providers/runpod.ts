@@ -1,3 +1,4 @@
+import sharp from 'sharp'
 import { withRetry } from '@/lib/retry'
 import {
   buildLtxI2vWorkflow,
@@ -37,6 +38,18 @@ import type {
  */
 
 const RUNPOD_BASE = 'https://api.runpod.ai/v2'
+
+/** RunPod rejects a larger /run body with a 400 before the worker ever sees it. */
+const RUNPOD_MAX_BODY_BYTES = 10 * 1024 * 1024
+
+/**
+ * Long side the first frame is downscaled to before it goes into the payload.
+ * The graph already rescales it to exactly this (ResizeImageMaskNode, node
+ * 398:351) before it conditions anything, so every pixel above this is thrown
+ * away on the worker — after being base64-inflated by a third and counted
+ * against the 10 MiB body limit. A phone photo alone can blow that limit.
+ */
+const FIRST_FRAME_MAX_SIDE = 1536
 
 interface EndpointDef {
   envKey: string
@@ -171,10 +184,21 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
       Authorization: `Bearer ${this.apiKey}`,
     }
 
+    const body = JSON.stringify({ input })
+    const bodyBytes = Buffer.byteLength(body)
+    if (bodyBytes > RUNPOD_MAX_BODY_BYTES) {
+      // RunPod's own message names the limit but not what filled it, and the
+      // request is one big base64 blob either way.
+      throw new Error(
+        `Payload is ${(bodyBytes / 1024 / 1024).toFixed(1)} MB, over RunPod's 10 MiB limit for /run. ` +
+          'The attached media is too large to send inline.'
+      )
+    }
+
     const submit = await fetch(`${RUNPOD_BASE}/${endpointId}/run`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ input }),
+      body,
     })
     if (!submit.ok) {
       throw new Error(`RunPod /run failed (${submit.status}): ${await submit.text()}`)
@@ -328,7 +352,7 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     const megapixels = opts.megapixels ?? LTX_DEFAULTS.megapixels
     const fps = opts.fps ?? LTX_DEFAULTS.fps
 
-    const imageName = 'first_frame.png'
+    const { name: imageName, base64: imageB64 } = await encodeFirstFrame(params.imageUrl)
     const workflow = buildLtxI2vWorkflow({
       prompt: params.prompt,
       imageName,
@@ -340,8 +364,6 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
       enhancePrompt: opts.enhancePrompt ?? LTX_DEFAULTS.enhancePrompt,
       negativePrompt: opts.negativePrompt ?? LTX_DEFAULTS.negativePrompt,
     })
-
-    const imageB64 = await fetchAsBase64(params.imageUrl)
 
     return withRetry(async () => {
       const { output, executionMs } = await this.runJob(
@@ -462,4 +484,40 @@ export async function fetchAsBase64(url: string): Promise<string> {
   if (!res.ok) throw new Error(`Failed to fetch reference media (${res.status})`)
   const buf = Buffer.from(await res.arrayBuffer())
   return buf.toString('base64')
+}
+
+/**
+ * Prepares the first frame for the ComfyUI payload: downscaled to what the
+ * graph keeps and re-encoded as JPEG, then base64'd.
+ *
+ * JPEG rather than the original PNG because LTXVPreprocess (node 398:350) runs
+ * the frame through JPEG compression at quality 18 anyway — holding out for
+ * lossless bytes buys nothing and costs an order of magnitude in payload size.
+ * EXIF orientation is baked in first, or a portrait photo would arrive on its
+ * side; alpha is flattened onto white, since JPEG has none.
+ */
+async function encodeFirstFrame(url: string): Promise<{ name: string; base64: string }> {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`Failed to fetch the first frame (${res.status})`)
+  const original = Buffer.from(await res.arrayBuffer())
+
+  try {
+    const jpeg = await sharp(original)
+      .rotate()
+      .resize({
+        width: FIRST_FRAME_MAX_SIDE,
+        height: FIRST_FRAME_MAX_SIDE,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 95, mozjpeg: true })
+      .toBuffer()
+    return { name: 'first_frame.jpg', base64: jpeg.toString('base64') }
+  } catch (err) {
+    // An unreadable or exotic format shouldn't block the run — send it as-is and
+    // let the body-size guard explain if it turns out to be too big.
+    console.warn('[runpod] could not downscale the first frame, sending it as-is:', err)
+    return { name: 'first_frame.png', base64: original.toString('base64') }
+  }
 }
