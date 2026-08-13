@@ -4,6 +4,7 @@ import { useState, useCallback, useId, useRef, useEffect } from 'react'
 import { MessageList, type ChatMessage, type MessageAttachment } from './message-list'
 import { MessageInput, type Attachment } from './message-input'
 import { CostSummaryCard } from './cost-summary-card'
+import { uploadFile } from '@/lib/upload-client'
 import type { ContentPlan } from '@/types/plan'
 import type { GraphStatus, GenerationProgress } from '@/types/graph-state'
 import type { ProjectSettings } from '@/types/project'
@@ -219,12 +220,7 @@ export function ChatPanel({ projectId, projectSettings, onGenerationStarted, onG
       try {
         uploaded = await Promise.all(
           pending.map(async (a) => {
-            const form = new FormData()
-            form.append('file', a.file)
-            form.append('projectId', projectId)
-            const res = await fetch('/api/upload', { method: 'POST', body: form })
-            if (!res.ok) throw new Error(`Upload failed (${res.status})`)
-            const { url } = (await res.json()) as { url: string }
+            const url = await uploadFile(a.file, projectId)
             return { url, kind: a.kind, name: a.file.name, mimeType: a.file.type }
           })
         )

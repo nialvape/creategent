@@ -20,8 +20,60 @@ import type {
   LabVideoParams,
 } from '@/types/testing'
 
+export const runtime = 'nodejs'
+// A ComfyUI render is minutes of GPU time, not seconds. This is the ceiling the
+// host allows; the provider's own 25-minute poll window outlives it, so a very
+// long render still dies here as a gateway timeout.
+export const maxDuration = 300
+
 /** Storage prefix for lab uploads/outputs — keeps bench files out of real projects. */
 export const LAB_PROJECT_ID = 'model-lab'
+
+/**
+ * Largest inline data: URL allowed in the response. The host caps a serverless
+ * response body at 4.5 MB, so a video returned inline fails the run *after* the
+ * GPU time has been paid for — anything above this goes to storage and travels
+ * as a link instead.
+ */
+const MAX_INLINE_BYTES = 3 * 1024 * 1024
+
+const EXT_BY_TYPE: Record<string, string> = {
+  'video/mp4': 'mp4',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+}
+
+/**
+ * Moves oversized inline outputs into storage. The RunPod ComfyUI worker returns
+ * the finished mp4 base64-encoded (there's no S3 configured on the endpoint), so
+ * without this the whole video would be embedded in the JSON response.
+ */
+async function externalizeLargeOutputs(outputs: LabOutput[]): Promise<LabOutput[]> {
+  return Promise.all(
+    outputs.map(async (out) => {
+      const match = out.url && /^data:([^;,]+);base64,/.exec(out.url)
+      if (!match) return out
+
+      const contentType = match[1]
+      const bytes = Buffer.from(out.url!.slice(match[0].length), 'base64')
+      if (bytes.byteLength <= MAX_INLINE_BYTES) return out
+
+      const ext = EXT_BY_TYPE[contentType] ?? contentType.split('/')[1] ?? 'bin'
+      try {
+        const path = await uploadAsset(LAB_PROJECT_ID, bytes, `lab_${Date.now()}.${ext}`, contentType)
+        return { ...out, url: await getAssetUrl(path) }
+      } catch (err) {
+        const mb = (bytes.byteLength / 1024 / 1024).toFixed(1)
+        const detail = err instanceof Error ? err.message : String(err)
+        throw new Error(
+          `The model produced a ${mb} MB ${ext} that could not be stored, and it is too large to return inline: ${detail}`
+        )
+      }
+    })
+  )
+}
 
 /** Same voice the audio agent uses, so TTS comparisons match production. */
 const DEFAULT_VOICE_ID = 'EXAVITQu4vr4xnSDxMaL' // Bella — multilingual
@@ -269,13 +321,13 @@ export async function POST(req: Request) {
       ok: true,
       capability,
       model,
+      outputs: await externalizeLargeOutputs(result.outputs),
       provider:
         capability === 'understanding'
           ? 'openrouter'
           : providerForModel(capability as MediaModelType, model),
       ms: Date.now() - startedAt,
       cost: result.cost,
-      outputs: result.outputs,
       metadata: result.metadata,
     }
     console.log(`[model-lab] ${capability} model=${model} ms=${payload.ms} cost=$${payload.cost}`)

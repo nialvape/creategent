@@ -10,6 +10,7 @@ import { LabRunCard, type LabRunRecord } from '@/components/testing/lab-run-card
 import { VideoParamsPanel } from '@/components/testing/video-params'
 import { RunPodStatus } from '@/components/testing/runpod-status'
 import { LTX_DEFAULTS, aspectRatioForSize } from '@/lib/comfy/ltx-2-5-i2v'
+import { readJson, uploadFile } from '@/lib/upload-client'
 import {
   UNDERSTANDING_MODELS,
   IMAGE_MODELS,
@@ -137,15 +138,10 @@ export default function ModelLabPage() {
         const cached = uploadedRef.current.get(att.id)
         if (cached) return cached
 
-        const form = new FormData()
-        form.append('file', att.file)
-        form.append('projectId', LAB_PROJECT_ID)
-        const res = await fetch('/api/upload', { method: 'POST', body: form })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error ?? `Upload failed (${res.status})`)
+        const url = await uploadFile(att.file, LAB_PROJECT_ID)
 
         const uploaded: LabFile = {
-          url: data.url,
+          url,
           name: att.file.name,
           mimeType: att.file.type,
           kind: att.kind,
@@ -200,7 +196,7 @@ export default function ModelLabPage() {
           videoParams: params,
         }),
       })
-      const data = await res.json()
+      const data = await readJson<LabRunResult & { error?: string }>(res)
 
       if (!res.ok) {
         // 400s are input problems, not model results — surface them on the form

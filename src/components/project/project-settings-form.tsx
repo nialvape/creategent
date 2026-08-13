@@ -4,6 +4,7 @@ import { useRef, useState } from 'react'
 import { Label } from '@/components/ui/label'
 import { ModelPicker } from '@/components/ui/model-picker'
 import { LLM_MODELS, IMAGE_MODELS, VIDEO_MODELS, AVATAR_MODELS, AUDIO_MODELS } from '@/lib/models'
+import { uploadFile } from '@/lib/upload-client'
 import type { ProjectSettings, QualityPreset } from '@/types/project'
 import { Upload, Loader2, Check, X } from 'lucide-react'
 
@@ -55,13 +56,7 @@ export function ProjectSettingsForm({
     setVoiceError(null)
     setUploadingVoice(true)
     try {
-      const body = new FormData()
-      body.append('file', file)
-      body.append('projectId', projectId)
-      const res = await fetch('/api/upload', { method: 'POST', body })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error ?? 'Upload failed')
-      set({ voiceCloneReferenceUrl: data.url })
+      set({ voiceCloneReferenceUrl: await uploadFile(file, projectId) })
     } catch (err) {
       setVoiceError(err instanceof Error ? err.message : 'Upload failed')
     } finally {
