@@ -55,19 +55,30 @@ async function fetchCredits(apiKey: string): Promise<RunPodStatus['credits']> {
   if (!res.ok) throw new Error(`GraphQL ${res.status}`)
 
   const body = (await res.json()) as {
-    data?: { myself?: { clientBalance?: number; currentSpendPerHr?: number; clientLifetimeSpend?: number } }
+    data?: {
+      myself?: {
+        clientBalance?: number | null
+        currentSpendPerHr?: number | null
+        clientLifetimeSpend?: number | null
+      } | null
+    }
     errors?: Array<{ message?: string }>
   }
-  // GraphQL reports auth failures as a 200 with an errors array, so a non-ok
-  // status is not enough to detect them.
-  if (body.errors?.length) {
-    throw new Error(body.errors.map((e) => e.message).filter(Boolean).join('; ') || 'GraphQL error')
-  }
   const me = body.data?.myself
-  if (!me) throw new Error('no account data')
+
+  // GraphQL reports auth failures as a 200 with an errors array, so a non-ok
+  // status is not enough to detect them. It also answers per field: a
+  // restricted key returns Unauthorized for clientLifetimeSpend while still
+  // resolving the balance, so errors only count as fatal when the balance
+  // itself is missing — otherwise the header would show "balance n/a" while
+  // holding a perfectly good number.
+  if (me?.clientBalance == null) {
+    const detail = body.errors?.map((e) => e.message).filter(Boolean).join('; ')
+    throw new Error(detail || 'no account data')
+  }
 
   return {
-    balance: me.clientBalance ?? 0,
+    balance: me.clientBalance,
     spendPerHour: me.currentSpendPerHr ?? 0,
     lifetimeSpend: me.clientLifetimeSpend ?? 0,
   }

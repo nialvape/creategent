@@ -2,13 +2,14 @@
 
 import { useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
-import { ArrowLeft, FlaskConical, Play, Loader2, Trash2 } from 'lucide-react'
+import { ArrowLeft, FlaskConical, Play, Loader2, Trash2, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ModelPicker } from '@/components/ui/model-picker'
 import { LabFilePicker, type LabAttachment } from '@/components/testing/lab-file-picker'
 import { LabRunCard, type LabRunRecord } from '@/components/testing/lab-run-card'
 import { VideoParamsPanel } from '@/components/testing/video-params'
 import { RunPodStatus } from '@/components/testing/runpod-status'
+import { ExportRatingsDialog } from '@/components/testing/export-ratings-dialog'
 import { LTX_DEFAULTS, aspectRatioForSize } from '@/lib/comfy/ltx-2-5-i2v'
 import { readJson, uploadFile } from '@/lib/upload-client'
 import {
@@ -97,8 +98,6 @@ const GROUPS: CapabilityGroup[] = [
   },
 ]
 
-let runCounter = 0
-
 export default function ModelLabPage() {
   const [capability, setCapability] = useState<LabCapability>('understanding')
   const [modelByCapability, setModelByCapability] = useState<Record<string, string>>(() =>
@@ -112,6 +111,7 @@ export default function ModelLabPage() {
   const [videoParams, setVideoParams] = useState<LabVideoParams>(DEFAULT_VIDEO_PARAMS)
   // Bumped after each run so the balance reflects what the run just cost.
   const [creditsKey, setCreditsKey] = useState(0)
+  const [exporting, setExporting] = useState(false)
 
   // Uploaded URL per attachment, so running the same files against a second
   // model re-uses the upload instead of paying for it again.
@@ -158,12 +158,19 @@ export default function ModelLabPage() {
     setBusy(true)
 
     const record: LabRunRecord = {
-      id: `run-${++runCounter}`,
+      id: crypto.randomUUID(),
       capability,
       model,
       modelName: modelDef?.name ?? model,
       prompt: prompt.trim(),
-      fileNames: attachments.map((a) => a.file.name),
+      // Local object URLs for now — swapped for the uploaded ones below, so a
+      // rating saved after the run never points at a blob: link.
+      files: attachments.map((a) => ({
+        url: a.url,
+        name: a.file.name,
+        mimeType: a.file.type,
+        kind: a.kind,
+      })),
       status: 'running',
     }
     setRuns((prev) => [record, ...prev])
@@ -185,6 +192,12 @@ export default function ModelLabPage() {
       }
 
       const files = await uploadAll()
+      // Record what the run is actually being given, now that it's settled —
+      // this is the snapshot a rating is saved against.
+      setRuns((prev) =>
+        prev.map((r) => (r.id === record.id ? { ...r, files, videoParams: params } : r))
+      )
+
       const res = await fetch('/api/testing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -244,6 +257,14 @@ export default function ModelLabPage() {
             <p className="hidden text-xs text-white/30 lg:block">
               One model, raw input, no graph — compare before wiring it into the agent.
             </p>
+            <button
+              type="button"
+              onClick={() => setExporting(true)}
+              className="flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-white/45 transition-colors hover:border-indigo-500/30 hover:text-white/80"
+            >
+              <Download className="h-3 w-3" />
+              Export ratings
+            </button>
             <RunPodStatus refreshKey={creditsKey} />
           </div>
         </div>
@@ -356,10 +377,20 @@ export default function ModelLabPage() {
               </p>
             </div>
           ) : (
-            runs.map((run) => <LabRunCard key={run.id} run={run} />)
+            runs.map((run) => (
+              <LabRunCard
+                key={run.id}
+                run={run}
+                onRated={(runId, rating) =>
+                  setRuns((prev) => prev.map((r) => (r.id === runId ? { ...r, rating } : r)))
+                }
+              />
+            ))
           )}
         </div>
       </div>
+
+      {exporting && <ExportRatingsDialog onClose={() => setExporting(false)} />}
     </div>
   )
 }

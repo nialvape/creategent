@@ -1,9 +1,11 @@
 'use client'
 
 import { useState } from 'react'
-import { AlertTriangle, ChevronDown, ChevronRight, Clock, DollarSign, Loader2, Copy, Check } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronRight, Clock, DollarSign, Loader2, Copy, Check, Star } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import type { LabCapability, LabRunResult } from '@/types/testing'
+import { RateRunDialog } from '@/components/testing/rate-run-dialog'
+import { isRatedCapability, type PromptRating } from '@/types/rating'
+import type { LabCapability, LabFile, LabRunResult, LabVideoParams } from '@/types/testing'
 
 /** One entry in the lab's run history: the input that was sent + what came back. */
 export interface LabRunRecord {
@@ -12,10 +14,19 @@ export interface LabRunRecord {
   model: string
   modelName: string
   prompt: string
-  fileNames: string[]
+  /**
+   * The attached files. Their `url` starts as a local object URL and is
+   * replaced by the uploaded one once the run reaches the provider — a rating
+   * is only offered after that, so it never records a blob: link.
+   */
+  files: LabFile[]
+  /** The knobs the run used. Video is the only capability that has any. */
+  videoParams?: LabVideoParams
   status: 'running' | 'done' | 'error'
   result?: LabRunResult
   error?: string
+  /** Set once this run has been rated, so the card stops offering it twice. */
+  rating?: PromptRating
 }
 
 const CAPABILITY_LABELS: Record<LabCapability, string> = {
@@ -35,10 +46,19 @@ function formatCost(cost: number): string {
   return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(3)}`
 }
 
-export function LabRunCard({ run }: { run: LabRunRecord }) {
+export function LabRunCard({
+  run,
+  onRated,
+}: {
+  run: LabRunRecord
+  onRated: (runId: string, rating: PromptRating) => void
+}) {
   const [showRaw, setShowRaw] = useState(false)
+  const [rating, setRating] = useState(false)
   const failed = run.status === 'error' || run.result?.ok === false
   const errorMessage = run.error ?? run.result?.error
+  // Only a run that actually produced something visual is worth judging.
+  const rateable = run.status === 'done' && run.result?.ok === true && isRatedCapability(run.capability)
 
   return (
     <div
@@ -80,18 +100,19 @@ export function LabRunCard({ run }: { run: LabRunRecord }) {
       {/* Input snapshot — what this run was actually given */}
       <div className="space-y-1 border-b border-white/8 px-4 py-2.5">
         {run.prompt && <p className="line-clamp-2 text-xs text-white/45">{run.prompt}</p>}
-        {run.fileNames.length > 0 && (
+        {run.files.length > 0 && (
           <div className="flex flex-wrap gap-1">
-            {run.fileNames.map((name) => (
-              <span key={name} className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-white/35">
-                {name}
+            {run.files.map((file) => (
+              <span
+                key={file.name}
+                className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-white/35"
+              >
+                {file.name}
               </span>
             ))}
           </div>
         )}
-        {!run.prompt && run.fileNames.length === 0 && (
-          <p className="text-xs text-white/25">no input</p>
-        )}
+        {!run.prompt && run.files.length === 0 && <p className="text-xs text-white/25">no input</p>}
       </div>
 
       {/* Output */}
@@ -137,6 +158,31 @@ export function LabRunCard({ run }: { run: LabRunRecord }) {
           </div>
         ))}
 
+        {/* Rating — the prompt behind a good result is the thing worth keeping,
+            and it's the only part of a run that survives this page. */}
+        {rateable &&
+          (run.rating ? (
+            <div className="flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+              <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+              <span className="text-xs text-amber-200/80">
+                Rated {averageScore(run.rating.scores).toFixed(1)}
+                <span className="text-amber-200/40">
+                  {' '}
+                  · {Object.keys(run.rating.scores).length} axes
+                </span>
+              </span>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setRating(true)}
+              className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/50 transition-colors hover:border-amber-500/30 hover:text-amber-200"
+            >
+              <Star className="h-3.5 w-3.5" />
+              Rate prompt
+            </button>
+          ))}
+
         {/* Raw provider metadata — nothing hidden during testing */}
         {run.result?.metadata && Object.keys(run.result.metadata).length > 0 && (
           <div>
@@ -156,8 +202,26 @@ export function LabRunCard({ run }: { run: LabRunRecord }) {
           </div>
         )}
       </div>
+
+      {rating && (
+        <RateRunDialog
+          run={run}
+          onClose={() => setRating(false)}
+          onSaved={(saved) => {
+            setRating(false)
+            onRated(run.id, saved)
+          }}
+        />
+      )}
     </div>
   )
+}
+
+/** Mean of the axes the rater actually scored. */
+export function averageScore(scores: Record<string, number>): number {
+  const values = Object.values(scores)
+  if (values.length === 0) return 0
+  return values.reduce((sum, v) => sum + v, 0) / values.length
 }
 
 /** Text results get a copy button — they're what you paste into a prompt file. */

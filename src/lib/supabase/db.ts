@@ -3,6 +3,7 @@ import { createServerClient } from './client'
 import type { Project, ProjectSettings } from '@/types/project'
 import type { Asset, AssetStatus } from '@/types/asset'
 import type { CostEvent } from '@/types/cost'
+import type { PromptRating, PromptRatingInput } from '@/types/rating'
 
 function db() { return createServerClient() }
 
@@ -148,4 +149,27 @@ export async function getCostSummary(
     byProvider[e.provider] = (byProvider[e.provider] ?? 0) + e.cost_usd
   }
   return { total, byProvider }
+}
+
+// --- Prompt Ratings (Model Lab) ---
+
+export async function createPromptRating(rating: PromptRatingInput): Promise<PromptRating> {
+  const { data, error } = await db()
+    .from('prompt_ratings')
+    .insert(rating as any)
+    .select()
+    .single()
+  if (error) throw error
+  return data as PromptRating
+}
+
+export async function getPromptRatings(
+  filter: { model?: string; capability?: string } = {}
+): Promise<PromptRating[]> {
+  let query = db().from('prompt_ratings').select('*').order('created_at', { ascending: false })
+  if (filter.model) query = query.eq('model', filter.model)
+  if (filter.capability) query = query.eq('capability', filter.capability)
+  const { data, error } = await query
+  if (error) throw error
+  return (data ?? []) as PromptRating[]
 }
