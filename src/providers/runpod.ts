@@ -187,17 +187,18 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     this.apiKey = apiKey
   }
 
-  /** Submit a job and poll until it finishes. Returns the handler `output`. */
-  private async runJob(
-    endpointId: string,
-    input: Record<string, unknown>,
-    opts: { timeoutMs?: number; pollMs?: number } = {}
-  ): Promise<{ output: Record<string, unknown>; executionMs: number }> {
-    const headers = {
+  private get headers() {
+    return {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${this.apiKey}`,
     }
+  }
 
+  /** Queue a job. Returns its id immediately — nothing waits on the render. */
+  private async submitJob(
+    endpointId: string,
+    input: Record<string, unknown>
+  ): Promise<string> {
     const body = JSON.stringify({ input })
     const bodyBytes = Buffer.byteLength(body)
     if (bodyBytes > RUNPOD_MAX_BODY_BYTES) {
@@ -211,7 +212,7 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
 
     const submit = await fetch(`${RUNPOD_BASE}/${endpointId}/run`, {
       method: 'POST',
-      headers,
+      headers: this.headers,
       body,
     })
     if (!submit.ok) {
@@ -219,53 +220,81 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     }
     const { id } = (await submit.json()) as { id?: string }
     if (!id) throw new Error('RunPod /run returned no job id')
+    return id
+  }
+
+  /**
+   * One look at a job. `null` means still working — NOT a failure.
+   *
+   * Separating this from the wait loop is what lets a render outlive the
+   * request that started it: an HTTP handler with a gateway ceiling can submit,
+   * hand back the id, and collect the result from a later request instead of
+   * paying for GPU time nobody is left to receive.
+   *
+   * `queuedForMs` is how long the caller has been waiting overall. It only
+   * gates the capacity diagnosis, which would otherwise cry "no workers" about
+   * a job that was submitted four seconds ago.
+   */
+  private async checkJob(
+    endpointId: string,
+    jobId: string,
+    opts: { queuedForMs?: number; cancelOnFailure?: boolean } = {}
+  ): Promise<{ output: Record<string, unknown>; executionMs: number } | null> {
+    const res = await fetch(`${RUNPOD_BASE}/${endpointId}/status/${jobId}`, {
+      headers: this.headers,
+      cache: 'no-store',
+    })
+    if (!res.ok) {
+      throw new Error(`RunPod /status failed (${res.status}): ${await res.text()}`)
+    }
+    const body = (await res.json()) as RunStatus
+
+    if (body.status === 'COMPLETED') {
+      if (!body.output) throw new Error('RunPod job completed but returned no output')
+      return { output: body.output, executionMs: body.executionTime ?? 0 }
+    }
+    if (body.status === 'FAILED' || body.status === 'CANCELLED' || body.status === 'TIMED_OUT') {
+      throw new Error(`RunPod job ${body.status}: ${body.error ?? 'no error detail'}`)
+    }
+
+    // A job that never leaves the queue looks identical to a slow one until the
+    // timeout fires. Ask the endpoint why, so the caller gets "no GPU capacity"
+    // in a minute instead of a bare timeout much later.
+    if (body.status === 'IN_QUEUE' && (opts.queuedForMs ?? 0) > QUEUE_DIAGNOSIS_AFTER_MS) {
+      const workers = await this.workerCounts(endpointId)
+      const reason = workers && diagnoseQueue(workers)
+      if (reason) {
+        if (opts.cancelOnFailure !== false) await this.cancelJob(endpointId, jobId)
+        throw new Error(`RunPod endpoint can't run this job: ${reason}`)
+      }
+    }
+
+    return null
+  }
+
+  /** Submit and block until the job finishes. For callers that can wait. */
+  private async runJob(
+    endpointId: string,
+    input: Record<string, unknown>,
+    opts: { timeoutMs?: number; pollMs?: number } = {}
+  ): Promise<{ output: Record<string, unknown>; executionMs: number }> {
+    const id = await this.submitJob(endpointId, input)
 
     const timeoutMs = opts.timeoutMs ?? 5 * 60_000
     const pollMs = opts.pollMs ?? 3_000
     const startedAt = Date.now()
     const deadline = startedAt + timeoutMs
-    let diagnosed = false
 
     for (;;) {
-      const res = await fetch(`${RUNPOD_BASE}/${endpointId}/status/${id}`, { headers })
-      if (!res.ok) {
-        throw new Error(`RunPod /status failed (${res.status}): ${await res.text()}`)
-      }
-      const body = (await res.json()) as RunStatus
-
-      if (body.status === 'COMPLETED') {
-        if (!body.output) throw new Error('RunPod job completed but returned no output')
-        return { output: body.output, executionMs: body.executionTime ?? 0 }
-      }
-      if (body.status === 'FAILED' || body.status === 'CANCELLED' || body.status === 'TIMED_OUT') {
-        throw new Error(`RunPod job ${body.status}: ${body.error ?? 'no error detail'}`)
-      }
-
-      // A job that never leaves the queue looks identical to a slow one until
-      // the timeout fires. Ask the endpoint why once, early, so the caller gets
-      // "no GPU capacity" in a minute instead of a bare timeout in 25.
-      if (
-        !diagnosed &&
-        body.status === 'IN_QUEUE' &&
-        Date.now() - startedAt > QUEUE_DIAGNOSIS_AFTER_MS
-      ) {
-        diagnosed = true
-        const workers = await this.workerCounts(endpointId)
-        const reason = workers && diagnoseQueue(workers)
-        if (reason) {
-          await this.cancelJob(endpointId, id)
-          throw new Error(`RunPod endpoint can't run this job: ${reason}`)
-        }
-      }
+      const done = await this.checkJob(endpointId, id, { queuedForMs: Date.now() - startedAt })
+      if (done) return done
 
       if (Date.now() > deadline) {
         const workers = await this.workerCounts(endpointId)
-        const detail = workers
-          ? ` Workers: ${JSON.stringify(workers)}.`
-          : ''
+        const detail = workers ? ` Workers: ${JSON.stringify(workers)}.` : ''
         await this.cancelJob(endpointId, id)
         throw new Error(
-          `RunPod job timed out after ${Math.round(timeoutMs / 1000)}s while ${body.status}.${detail}`
+          `RunPod job timed out after ${Math.round(timeoutMs / 1000)}s.${detail}`
         )
       }
       await new Promise((r) => setTimeout(r, pollMs))
@@ -363,10 +392,36 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     gpuUsdPerSec: number,
     contract: ComfyContract
   ): Promise<GenerationResult> {
+    const input = await this.buildComfyVideoJob(params, contract)
+
+    return withRetry(async () => {
+      const { output, executionMs } = await this.runJob(
+        endpointId,
+        input,
+        // Two sampling stages plus a tiled VAE decode: minutes, not seconds.
+        { timeoutMs: 25 * 60_000, pollMs: 5_000 }
+      )
+      return this.comfyVideoResult(output, executionMs, params, gpuUsdPerSec)
+    }, params.maxAttempts ?? 1)
+  }
+
+  /** The graph settings a result needs in order to be described. */
+  private comfyContext(params: { duration: number; options?: VideoOptions }) {
     const opts = params.options ?? {}
-    const aspectRatio = (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)'
-    const megapixels = opts.megapixels ?? LTX_DEFAULTS.megapixels
-    const fps = opts.fps ?? LTX_DEFAULTS.fps
+    return {
+      aspectRatio: (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)',
+      megapixels: opts.megapixels ?? LTX_DEFAULTS.megapixels,
+      fps: opts.fps ?? LTX_DEFAULTS.fps,
+      durationSec: params.duration,
+    }
+  }
+
+  private async buildComfyVideoJob(
+    params: { prompt: string; imageUrl: string; duration: number; options?: VideoOptions },
+    contract: ComfyContract
+  ): Promise<Record<string, unknown>> {
+    const opts = params.options ?? {}
+    const { aspectRatio, megapixels, fps } = this.comfyContext(params)
 
     const firstFrame = await encodeImageInput(params.imageUrl, 'first_frame')
     const workflow = buildLtxI2vWorkflow({
@@ -381,53 +436,100 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
       negativePrompt: opts.negativePrompt ?? LTX_DEFAULTS.negativePrompt,
     })
 
-    return withRetry(async () => {
-      const { output, executionMs } = await this.runJob(
-        endpointId,
-        comfyJobInput(workflow, [firstFrame], contract),
-        // Two sampling stages plus a tiled VAE decode: minutes, not seconds.
-        { timeoutMs: 25 * 60_000, pollMs: 5_000 }
-      )
+    return comfyJobInput(workflow, [firstFrame], contract)
+  }
 
-      const result = normalizeComfyOutput(output)
+  /** Turns a finished job's output into the result the app expects. */
+  private comfyVideoResult(
+    output: Record<string, unknown>,
+    executionMs: number,
+    params: { model: string; duration: number; options?: VideoOptions },
+    gpuUsdPerSec: number
+  ): GenerationResult {
+    const result = normalizeComfyOutput(output)
 
-      // Match on MIME, not on the node key: LTX's mp4 arrives under `images`
-      // because SaveVideo reports through PreviewVideo.
-      const video = pickComfyFile(result.files, 'video/')
-      if (!video) {
-        // Non-fatal problems (a failed upload, a dropped output) arrive in the
-        // result rather than as a job failure, and a graph that produced only
-        // audio is a real thing to say out loud.
-        throw new Error(`ComfyUI returned no video — got ${describeComfyOutput(result)}`)
-      }
+    // Match on MIME, not on the node key: LTX's mp4 arrives under `images`
+    // because SaveVideo reports through PreviewVideo.
+    const video = pickComfyFile(result.files, 'video/')
+    if (!video) {
+      // Non-fatal problems (a failed upload, a dropped output) arrive in the
+      // result rather than as a job failure, and a graph that produced only
+      // audio is a real thing to say out loud.
+      throw new Error(`ComfyUI returned no video — got ${describeComfyOutput(result)}`)
+    }
 
-      // Anything else the graph emitted (a separate audio track, a caption)
-      // rides along in metadata instead of being dropped on the floor.
-      const extras = result.files.filter((f) => f !== video)
+    // Anything else the graph emitted (a separate audio track, a caption)
+    // rides along in metadata instead of being dropped on the floor.
+    const extras = result.files.filter((f) => f !== video)
+    const ctx = this.comfyContext(params)
+    const { width, height } = resolveDimensions(ctx.aspectRatio, ctx.megapixels)
 
-      const { width, height } = resolveDimensions(aspectRatio, megapixels)
-      return {
-        url: comfyFileUrl(video),
-        cost: (executionMs / 1000) * gpuUsdPerSec,
-        model: params.model,
-        provider: 'runpod',
-        metadata: {
-          executionMs,
-          filename: video.filename,
-          width,
-          height,
-          frames: frameCount(params.duration, fps),
-          aspectRatio,
-          megapixels,
-          fps,
-          errors: result.errors.length ? result.errors : undefined,
-          extraFiles: extras.length
-            ? extras.map((f) => ({ filename: f.filename, mime: f.mime, size: f.size }))
-            : undefined,
-          values: result.values.length ? result.values : undefined,
-        },
-      }
-    }, params.maxAttempts ?? 1)
+    return {
+      url: comfyFileUrl(video),
+      cost: (executionMs / 1000) * gpuUsdPerSec,
+      model: params.model,
+      provider: 'runpod',
+      metadata: {
+        executionMs,
+        filename: video.filename,
+        width,
+        height,
+        frames: frameCount(ctx.durationSec, ctx.fps),
+        aspectRatio: ctx.aspectRatio,
+        megapixels: ctx.megapixels,
+        fps: ctx.fps,
+        errors: result.errors.length ? result.errors : undefined,
+        extraFiles: extras.length
+          ? extras.map((f) => ({ filename: f.filename, mime: f.mime, size: f.size }))
+          : undefined,
+        values: result.values.length ? result.values : undefined,
+      },
+    }
+  }
+
+  /** True when this model can be submitted now and collected later. */
+  supportsAsyncVideo(model: string): boolean {
+    return ENDPOINTS[model]?.kind === 'comfy'
+  }
+
+  /**
+   * Queue a render and return its job id without waiting for it.
+   *
+   * The entry point for callers that cannot block for twenty minutes — an HTTP
+   * handler with a gateway ceiling, chiefly. Pair with `collectVideo`, which
+   * can be called from a later, unrelated request.
+   */
+  async submitVideo(params: {
+    prompt: string
+    model: string
+    imageUrl: string
+    duration: number
+    options?: VideoOptions
+  }): Promise<string> {
+    const { id, kind, contract } = endpointFor(params.model)
+    if (kind !== 'comfy') {
+      throw new Error(`RunPod model "${params.model}" cannot be submitted asynchronously`)
+    }
+    const jobId = await this.submitJob(id, await this.buildComfyVideoJob(params, contract))
+    console.log(`[runpod] queued ${params.model} as job ${jobId}`)
+    return jobId
+  }
+
+  /**
+   * Fetch a submitted render if it has finished. `null` means still running.
+   *
+   * `params` has to describe the same job that was submitted — it is only used
+   * to label the result (dimensions, frame count), never to re-run anything.
+   */
+  async collectVideo(
+    jobId: string,
+    params: { model: string; duration: number; options?: VideoOptions },
+    opts: { queuedForMs?: number } = {}
+  ): Promise<GenerationResult | null> {
+    const { id, gpuUsdPerSec } = endpointFor(params.model)
+    const done = await this.checkJob(id, jobId, { queuedForMs: opts.queuedForMs })
+    if (!done) return null
+    return this.comfyVideoResult(done.output, done.executionMs, params, gpuUsdPerSec)
   }
 
   async generateAvatarVideo(params: {

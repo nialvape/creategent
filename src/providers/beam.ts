@@ -31,8 +31,9 @@ import type { MediaProvider, GenerationResult, VideoOptions } from '@/types/prov
  *     equivalent of RunPod's 10 MiB body limit to design around, in either
  *     direction.
  *   - Beam's RTX 5090 is ~$0.68/hr against RunPod's $0.99/hr for the same card,
- *     and Beam's promotional credit applies to serverless (a task queue scales
- *     to zero, so it qualifies — a Pod would not).
+ *     and the promotional credit is flagged "Serverless only" — a task queue
+ *     qualifies, the Pod in `beam/ltx25/` does not. That, plus scaling to zero,
+ *     is why this is a task queue and not the Pod we prototyped on.
  *
  * What has NOT been measured here is the cold start. On the ltx25 Pod a cold
  * container spent ~19 minutes reading ~40 GB of weights off the distributed
@@ -112,12 +113,8 @@ export class BeamAdapter implements MediaProvider {
     }
   }
 
-  /** Submit a task and poll until it finishes. Returns the handler's output. */
-  private async runTask(
-    url: string,
-    input: Record<string, unknown>,
-    opts: { timeoutMs?: number; pollMs?: number } = {}
-  ): Promise<{ output: Record<string, unknown>; executionMs: number }> {
+  /** Queue a task. Returns its id immediately — nothing waits on the render. */
+  private async submitTask(url: string, input: Record<string, unknown>): Promise<string> {
     const submit = await fetch(url, {
       method: 'POST',
       headers: this.headers,
@@ -129,32 +126,62 @@ export class BeamAdapter implements MediaProvider {
 
     const { task_id: taskId } = (await submit.json()) as { task_id?: string }
     if (!taskId) throw new Error('Beam accepted the task but returned no task_id')
+    return taskId
+  }
 
-    const timeoutMs = opts.timeoutMs ?? 25 * 60_000
+  /**
+   * One look at a task. `null` means still working — NOT a failure.
+   *
+   * Separating this from the wait loop is what makes a render survive the
+   * caller: an HTTP request that dies (the lab route's 300s ceiling, a closed
+   * tab) no longer takes the generation with it, because the task id is enough
+   * to come back for the result later.
+   */
+  private async checkTask(
+    taskId: string
+  ): Promise<{ output: Record<string, unknown>; executionMs: number } | null> {
+    const res = await fetch(`${BEAM_TASK_API}/${taskId}/`, {
+      headers: this.headers,
+      cache: 'no-store',
+    })
+    if (!res.ok) {
+      throw new Error(`Beam task poll failed (${res.status}): ${await res.text()}`)
+    }
+
+    const task = (await res.json()) as BeamTaskStatus
+    const status = (task.status ?? '').toUpperCase()
+
+    if (DONE_STATUSES.has(status)) {
+      return { output: await this.resolveOutput(task), executionMs: executionMsOf(task) }
+    }
+    if (FAILED_STATUSES.has(status)) {
+      throw new Error(`Beam task ${status} (${taskId})`)
+    }
+    return null
+  }
+
+  /** Submit and block until the task finishes. For callers that can wait. */
+  private async runTask(
+    url: string,
+    input: Record<string, unknown>,
+    opts: { timeoutMs?: number; pollMs?: number } = {}
+  ): Promise<{ output: Record<string, unknown>; executionMs: number }> {
+    const taskId = await this.submitTask(url, input)
+
+    const timeoutMs = opts.timeoutMs ?? 40 * 60_000
     const pollMs = opts.pollMs ?? 5_000
     const deadline = Date.now() + timeoutMs
 
     for (;;) {
-      const res = await fetch(`${BEAM_TASK_API}/${taskId}/`, {
-        headers: this.headers,
-        cache: 'no-store',
-      })
-      if (!res.ok) {
-        throw new Error(`Beam task poll failed (${res.status}): ${await res.text()}`)
-      }
-      const task = (await res.json()) as BeamTaskStatus
-      const status = (task.status ?? '').toUpperCase()
-
-      if (DONE_STATUSES.has(status)) {
-        return { output: await this.resolveOutput(task), executionMs: executionMsOf(task) }
-      }
-      if (FAILED_STATUSES.has(status)) {
-        throw new Error(`Beam task ${status} (${taskId})`)
-      }
+      const done = await this.checkTask(taskId)
+      if (done) return done
 
       if (Date.now() > deadline) {
+        // The task keeps running on Beam — name it, so the result can still be
+        // collected instead of paid for and thrown away.
         throw new Error(
-          `Beam task timed out after ${Math.round(timeoutMs / 1000)}s while ${status || 'PENDING'} (${taskId})`
+          `Beam task ${taskId} did not finish within ${Math.round(timeoutMs / 60_000)} min. ` +
+            'It is still running; collect it with this id.'
         )
       }
       await new Promise((r) => setTimeout(r, pollMs))
@@ -196,6 +223,124 @@ export class BeamAdapter implements MediaProvider {
     throw new Error('Beam adapter does not provide image generation')
   }
 
+  /** The graph settings a result needs in order to be described. */
+  private videoContext(params: { duration: number; options?: VideoOptions }) {
+    const opts = params.options ?? {}
+    return {
+      aspectRatio: (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)',
+      megapixels: opts.megapixels ?? LTX_DEFAULTS.megapixels,
+      fps: opts.fps ?? LTX_DEFAULTS.fps,
+      durationSec: params.duration,
+    }
+  }
+
+  private async buildVideoJob(params: {
+    prompt: string
+    imageUrl: string
+    duration: number
+    options?: VideoOptions
+  }): Promise<Record<string, unknown>> {
+    const opts = params.options ?? {}
+    const ctx = this.videoContext(params)
+
+    const firstFrame = await encodeImageInput(params.imageUrl, 'first_frame')
+    const workflow = buildLtxI2vWorkflow({
+      prompt: params.prompt,
+      imageName: firstFrame.name,
+      aspectRatio: ctx.aspectRatio,
+      megapixels: ctx.megapixels,
+      durationSec: ctx.durationSec,
+      fps: ctx.fps,
+      seed: opts.seed,
+      enhancePrompt: opts.enhancePrompt ?? LTX_DEFAULTS.enhancePrompt,
+      negativePrompt: opts.negativePrompt ?? LTX_DEFAULTS.negativePrompt,
+    })
+
+    return comfyJobInput(workflow, [firstFrame], 'generic')
+  }
+
+  /** Turns a finished task's output into the result the app expects. */
+  private videoResult(
+    output: Record<string, unknown>,
+    executionMs: number,
+    params: { model: string; duration: number; options?: VideoOptions },
+    gpuUsdPerSec: number
+  ): GenerationResult {
+    if (typeof output.error === 'string') {
+      throw new Error(`Beam worker: ${output.error}`)
+    }
+
+    const result = normalizeComfyOutput(output)
+    const video = pickComfyFile(result.files, 'video/')
+    if (!video) {
+      throw new Error(`ComfyUI returned no video — got ${describeComfyOutput(result)}`)
+    }
+
+    const ctx = this.videoContext(params)
+    const extras = result.files.filter((f) => f !== video)
+    const { width, height } = resolveDimensions(ctx.aspectRatio, ctx.megapixels)
+
+    return {
+      // A Beam public_url expires (an hour by default), so whatever consumes
+      // this has to persist it rather than store the link.
+      url: comfyFileUrl(video),
+      cost: (executionMs / 1000) * gpuUsdPerSec,
+      model: params.model,
+      provider: 'beam',
+      metadata: {
+        executionMs,
+        filename: video.filename,
+        width,
+        height,
+        frames: frameCount(ctx.durationSec, ctx.fps),
+        aspectRatio: ctx.aspectRatio,
+        megapixels: ctx.megapixels,
+        fps: ctx.fps,
+        errors: result.errors.length ? result.errors : undefined,
+        extraFiles: extras.length
+          ? extras.map((f) => ({ filename: f.filename, mime: f.mime, size: f.size }))
+          : undefined,
+        values: result.values.length ? result.values : undefined,
+      },
+    }
+  }
+
+  /**
+   * Queue a render and return its task id without waiting for it.
+   *
+   * This is the entry point for callers that cannot block for twenty minutes —
+   * an HTTP handler with a gateway ceiling, chiefly. Pair it with
+   * `collectVideo`, which can be called from a later, unrelated request.
+   */
+  async submitVideo(params: {
+    prompt: string
+    model: string
+    imageUrl: string
+    duration: number
+    options?: VideoOptions
+  }): Promise<string> {
+    const { url } = endpointFor(params.model)
+    const taskId = await this.submitTask(url, await this.buildVideoJob(params))
+    console.log(`[beam] queued ${params.model} as task ${taskId}`)
+    return taskId
+  }
+
+  /**
+   * Fetch a submitted render if it has finished. `null` means still running.
+   *
+   * `params` has to describe the same job that was submitted — it is only used
+   * to label the result (dimensions, frame count), never to re-run anything.
+   */
+  async collectVideo(
+    taskId: string,
+    params: { model: string; duration: number; options?: VideoOptions }
+  ): Promise<GenerationResult | null> {
+    const { gpuUsdPerSec } = endpointFor(params.model)
+    const done = await this.checkTask(taskId)
+    if (!done) return null
+    return this.videoResult(done.output, done.executionMs, params, gpuUsdPerSec)
+  }
+
   async generateVideo(params: {
     prompt: string
     model: string
@@ -209,69 +354,15 @@ export class BeamAdapter implements MediaProvider {
   }): Promise<GenerationResult> {
     const { url, gpuUsdPerSec } = endpointFor(params.model)
 
-    const opts = params.options ?? {}
-    const aspectRatio = (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)'
-    const megapixels = opts.megapixels ?? LTX_DEFAULTS.megapixels
-    const fps = opts.fps ?? LTX_DEFAULTS.fps
-
-    const firstFrame = await encodeImageInput(params.imageUrl, 'first_frame')
-    const workflow = buildLtxI2vWorkflow({
-      prompt: params.prompt,
-      imageName: firstFrame.name,
-      aspectRatio,
-      megapixels,
-      durationSec: params.duration,
-      fps,
-      seed: opts.seed,
-      enhancePrompt: opts.enhancePrompt ?? LTX_DEFAULTS.enhancePrompt,
-      negativePrompt: opts.negativePrompt ?? LTX_DEFAULTS.negativePrompt,
-    })
-
     // Not retried by default, for the same reason as the RunPod path: a run
     // costs minutes of GPU time and the usual cause is a deterministic graph
     // error, so a silent second attempt just doubles a real bill.
     return withRetry(async () => {
       const { output, executionMs } = await this.runTask(
         url,
-        comfyJobInput(workflow, [firstFrame], 'generic')
+        await this.buildVideoJob(params)
       )
-
-      if (typeof output.error === 'string') {
-        throw new Error(`Beam worker: ${output.error}`)
-      }
-
-      const result = normalizeComfyOutput(output)
-      const video = pickComfyFile(result.files, 'video/')
-      if (!video) {
-        throw new Error(`ComfyUI returned no video — got ${describeComfyOutput(result)}`)
-      }
-
-      const extras = result.files.filter((f) => f !== video)
-      const { width, height } = resolveDimensions(aspectRatio, megapixels)
-
-      return {
-        // A Beam public_url expires (an hour by default), so whatever consumes
-        // this has to persist it rather than store the link.
-        url: comfyFileUrl(video),
-        cost: (executionMs / 1000) * gpuUsdPerSec,
-        model: params.model,
-        provider: 'beam',
-        metadata: {
-          executionMs,
-          filename: video.filename,
-          width,
-          height,
-          frames: frameCount(params.duration, fps),
-          aspectRatio,
-          megapixels,
-          fps,
-          errors: result.errors.length ? result.errors : undefined,
-          extraFiles: extras.length
-            ? extras.map((f) => ({ filename: f.filename, mime: f.mime, size: f.size }))
-            : undefined,
-          values: result.values.length ? result.values : undefined,
-        },
-      }
+      return this.videoResult(output, executionMs, params, gpuUsdPerSec)
     }, params.maxAttempts ?? 1)
   }
 

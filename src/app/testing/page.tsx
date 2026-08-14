@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { ArrowLeft, FlaskConical, Play, Loader2, Trash2, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -20,11 +20,63 @@ import {
   AUDIO_MODELS,
   type ModelDef,
 } from '@/lib/models'
-import type { LabCapability, LabFile, LabRunResult, LabVideoParams } from '@/types/testing'
+import type {
+  LabCapability,
+  LabFile,
+  LabPendingResult,
+  LabRunResult,
+  LabVideoParams,
+} from '@/types/testing'
 import { cn } from '@/lib/utils'
 
 /** Storage prefix for lab uploads — mirrors LAB_PROJECT_ID on the server. */
 const LAB_PROJECT_ID = 'model-lab'
+
+/**
+ * Renders queued on an async backend, kept across reloads.
+ *
+ * A ComfyUI render is minutes of GPU time that is billed whether or not anyone
+ * is listening. Holding the task id in memory alone meant a refresh, a crash or
+ * a closed tab threw away work already paid for — this is the fix for that.
+ */
+const PENDING_RUNS_KEY = 'cg_lab_pending_runs'
+
+/** How often to ask an async backend whether a queued render has finished. */
+const POLL_INTERVAL_MS = 10_000
+
+/** Everything needed to re-ask for a queued render's result. */
+interface PendingRun {
+  runId: string
+  taskId: string
+  startedAt: number
+  request: LabRunRequestBody
+}
+
+interface LabRunRequestBody {
+  capability: LabCapability
+  model: string
+  prompt: string
+  files: LabFile[]
+  videoParams?: LabVideoParams
+}
+
+function loadPendingRuns(): PendingRun[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(PENDING_RUNS_KEY)
+    return raw ? (JSON.parse(raw) as PendingRun[]) : []
+  } catch {
+    return []
+  }
+}
+
+function savePendingRuns(runs: PendingRun[]) {
+  try {
+    window.localStorage.setItem(PENDING_RUNS_KEY, JSON.stringify(runs))
+  } catch {
+    // A full or blocked localStorage must not break the run in flight.
+  }
+}
 
 const DEFAULT_VIDEO_PARAMS: LabVideoParams = {
   aspectRatio: 'auto',
@@ -117,6 +169,98 @@ export default function ModelLabPage() {
   // model re-uses the upload instead of paying for it again.
   const uploadedRef = useRef<Map<string, LabFile>>(new Map())
 
+  // Task ids already being polled, so a resumed run and a fresh one never end
+  // up with two loops asking for the same render.
+  const pollingRef = useRef<Set<string>>(new Set())
+
+  /**
+   * Follows a queued render to completion and drops it from the pending store.
+   *
+   * Deliberately open-ended: there is no client-side deadline, because the only
+   * thing a timeout here would achieve is abandoning GPU time that has already
+   * been spent. The user can close the tab — the id is on disk and the loop
+   * resumes on the next visit.
+   */
+  const pollPendingRun = useCallback(async (pending: PendingRun) => {
+    if (pollingRef.current.has(pending.taskId)) return
+    pollingRef.current.add(pending.taskId)
+
+    const finish = (patch: Partial<LabRunRecord>) => {
+      setRuns((prev) => prev.map((r) => (r.id === pending.runId ? { ...r, ...patch } : r)))
+      savePendingRuns(loadPendingRuns().filter((p) => p.taskId !== pending.taskId))
+      pollingRef.current.delete(pending.taskId)
+      setCreditsKey((k) => k + 1)
+    }
+
+    for (;;) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+
+      try {
+        const res = await fetch('/api/testing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...pending.request,
+            taskId: pending.taskId,
+            startedAt: pending.startedAt,
+          }),
+        })
+        const data = await readJson<(LabRunResult | LabPendingResult) & { error?: string }>(res)
+
+        if (res.status === 202 || (data as LabPendingResult).pending) continue
+
+        if (!res.ok) {
+          finish({ status: 'error', error: data.error ?? `Request failed (${res.status})` })
+          return
+        }
+
+        const result = data as LabRunResult
+        finish({
+          status: result.ok ? 'done' : 'error',
+          // The server only measured the collecting request; the elapsed time
+          // that means anything is from submit to now.
+          result: { ...result, ms: Date.now() - pending.startedAt },
+        })
+        return
+      } catch (err) {
+        // A dropped poll is not a dropped render — the task is still on the
+        // backend and the id is still stored, so keep asking.
+        console.warn('[model-lab] poll failed, retrying:', err)
+      }
+    }
+  }, [])
+
+  // Resume anything left queued by a previous visit. This is what turns a
+  // refresh mid-render from a lost generation into a slower one.
+  useEffect(() => {
+    const pending = loadPendingRuns()
+    if (!pending.length) return
+
+    // Hydration from localStorage on mount — client only, so an effect is the
+    // intended place for it.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRuns((prev) => [
+      ...pending.map((p): LabRunRecord => {
+        const def = VIDEO_MODELS.find((m) => m.id === p.request.model)
+        return {
+          id: p.runId,
+          capability: p.request.capability,
+          model: p.request.model,
+          modelName: def?.name ?? p.request.model,
+          prompt: p.request.prompt,
+          files: p.request.files,
+          videoParams: p.request.videoParams,
+          status: 'running',
+          taskId: p.taskId,
+          startedAt: p.startedAt,
+        }
+      }),
+      ...prev,
+    ])
+
+    pending.forEach((p) => void pollPendingRun(p))
+  }, [pollPendingRun])
+
   const group = GROUPS.find((g) => g.capability === capability)!
   const model = modelByCapability[capability]
   const modelDef = group.models.find((m) => m.id === model)
@@ -198,24 +342,40 @@ export default function ModelLabPage() {
         prev.map((r) => (r.id === record.id ? { ...r, files, videoParams: params } : r))
       )
 
+      const request: LabRunRequestBody = {
+        capability,
+        model,
+        prompt: prompt.trim(),
+        files,
+        videoParams: params,
+      }
+
+      const startedAt = Date.now()
       const res = await fetch('/api/testing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          capability,
-          model,
-          prompt: prompt.trim(),
-          files,
-          videoParams: params,
-        }),
+        body: JSON.stringify(request),
       })
-      const data = await readJson<LabRunResult & { error?: string }>(res)
+      const data = await readJson<(LabRunResult | LabPendingResult) & { error?: string }>(res)
 
-      if (!res.ok) {
+      if (!res.ok && res.status !== 202) {
         // 400s are input problems, not model results — surface them on the form
         // and drop the pending card.
         setInputError(data.error ?? `Request failed (${res.status})`)
         setRuns((prev) => prev.filter((r) => r.id !== record.id))
+        return
+      }
+
+      // Queued rather than rendered: the backend is doing minutes of GPU work
+      // and handed back a handle. Store it before anything else can go wrong.
+      if ((data as LabPendingResult).pending) {
+        const { taskId } = data as LabPendingResult
+        const pending: PendingRun = { runId: record.id, taskId, startedAt, request }
+        savePendingRuns([...loadPendingRuns(), pending])
+        setRuns((prev) =>
+          prev.map((r) => (r.id === record.id ? { ...r, taskId, startedAt } : r))
+        )
+        void pollPendingRun(pending)
         return
       }
 

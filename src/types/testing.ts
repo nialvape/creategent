@@ -52,6 +52,22 @@ export interface LabOutput {
   url?: string
 }
 
+/**
+ * What a queued-but-unfinished run looks like on the wire (HTTP 202).
+ *
+ * Async backends (Beam) hand back a task id instead of a result, because a
+ * ComfyUI render outlives any request timeout the route can set. The client
+ * holds the id — in localStorage, so a reload or a closed tab does not orphan a
+ * generation that is already being paid for — and re-POSTs the same body with
+ * `taskId` until the result comes back.
+ */
+export interface LabPendingResult {
+  pending: true
+  taskId: string
+  model: string
+  capability: LabCapability
+}
+
 export interface LabRunResult {
   ok: boolean
   capability: LabCapability

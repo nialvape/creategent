@@ -20,7 +20,11 @@ export function getLLMProvider(): LLMProvider {
   return llmProvider
 }
 
-function getRunPodProvider(): RunPodAdapter {
+/**
+ * The RunPod adapter itself, not behind the MediaProvider interface — for
+ * callers that need `submitVideo` / `collectVideo` (see `getBeamProvider`).
+ */
+export function getRunPodProvider(): RunPodAdapter {
   if (!runpodProvider) {
     const apiKey = process.env.RUNPOD_API_KEY
     if (!apiKey) throw new Error('RUNPOD_API_KEY is not set')
@@ -29,7 +33,14 @@ function getRunPodProvider(): RunPodAdapter {
   return runpodProvider
 }
 
-function getBeamProvider(): BeamAdapter {
+/**
+ * The Beam adapter itself, not behind the MediaProvider interface.
+ *
+ * Callers that cannot block for a whole render (an HTTP handler with a gateway
+ * ceiling) need `submitVideo` / `collectVideo`, which are Beam-specific and
+ * deliberately outside the provider contract.
+ */
+export function getBeamProvider(): BeamAdapter {
   if (!beamProvider) {
     const token = process.env.BEAM_TOKEN
     if (!token) throw new Error('BEAM_TOKEN is not set')

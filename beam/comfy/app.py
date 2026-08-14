@@ -11,8 +11,11 @@ is minutes even warm, and ~19 of them on a cold container. A task_queue returns
 a `task_id` immediately and the caller polls `GET /v2/task/{id}/`, which is what
 `src/providers/beam.ts` does.
 
-A task_queue is still serverless — it scales to zero, so Beam's promotional
-credit (which cannot pay for a GPU pool or a Pod reservation) applies to it.
+A task_queue is also the shape the promotional credit can pay for: both grants
+are flagged "Serverless only" in the dashboard, and a Pod is not serverless — a
+19-minute Pod generation drew $0.00 from the credit, so its GPU time went
+somewhere else entirely. And unlike a Pod it scales to zero: a Pod bills every
+second until you stop it from the dashboard.
 
 Why the weights are not downloaded here
 ---------------------------------------

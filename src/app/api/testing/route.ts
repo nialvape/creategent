@@ -1,4 +1,13 @@
-import { getLLMProvider, getMediaProvider, getAudioProvider } from '@/providers/registry'
+import {
+  getLLMProvider,
+  getMediaProvider,
+  getAudioProvider,
+  getBeamProvider,
+  getRunPodProvider,
+} from '@/providers/registry'
+import { isBeamModel } from '@/providers/beam'
+import { isRunPodModel } from '@/providers/runpod'
+import type { GenerationResult } from '@/types/provider'
 import { uploadAsset, getAssetUrl } from '@/lib/supabase/storage'
 import { providerForModel, type MediaModelType } from '@/lib/models'
 import {
@@ -16,14 +25,17 @@ import type {
   LabCapability,
   LabFile,
   LabOutput,
+  LabPendingResult,
   LabRunResult,
   LabVideoParams,
 } from '@/types/testing'
 
 export const runtime = 'nodejs'
-// A ComfyUI render is minutes of GPU time, not seconds. This is the ceiling the
-// host allows; the provider's own 25-minute poll window outlives it, so a very
-// long render still dies here as a gateway timeout.
+// A ComfyUI render is minutes of GPU time, not seconds — longer than any ceiling
+// this route can raise, so waiting inside the request was always going to lose
+// races. Backends that can hand back a job id (Beam today) are submitted here
+// and collected by a later request instead; see `runVideoAsync`. Everything else
+// still has to fit inside this budget.
 export const maxDuration = 300
 
 /** Storage prefix for lab uploads/outputs — keeps bench files out of real projects. */
@@ -153,7 +165,11 @@ async function runImage(model: string, prompt: string): Promise<{ outputs: LabOu
   }
 }
 
-async function runVideo(
+/**
+ * Validates a video request and derives everything both the sync and async
+ * paths need from it. Shared so the two cannot disagree about what was asked.
+ */
+function videoRequest(
   model: string,
   prompt: string,
   files: LabFile[],
@@ -184,13 +200,11 @@ async function runVideo(
     megapixels
   )
 
-  const res = await getMediaProvider(model).generateVideo({
-    prompt,
-    model,
-    imageUrl: source.url,
+  return {
+    source,
+    duration,
     width,
     height,
-    duration,
     options: videoParams && {
       aspectRatio,
       megapixels,
@@ -199,9 +213,139 @@ async function runVideo(
       enhancePrompt: videoParams.enhancePrompt,
       negativePrompt: videoParams.negativePrompt,
     },
+  }
+}
+
+async function runVideo(
+  model: string,
+  prompt: string,
+  files: LabFile[],
+  videoParams?: LabVideoParams
+) {
+  const { source, duration, width, height, options } = videoRequest(
+    model,
+    prompt,
+    files,
+    videoParams
+  )
+
+  const res = await getMediaProvider(model).generateVideo({
+    prompt,
+    model,
+    imageUrl: source.url,
+    width,
+    height,
+    duration,
+    options,
   })
   return {
     outputs: res.url ? [{ kind: 'video' as const, label: `from ${source.name}`, url: res.url }] : [],
+    cost: res.cost,
+    metadata: res.metadata,
+  }
+}
+
+/**
+ * A backend that can hand back a job id instead of a finished render.
+ *
+ * Both self-hosted backends work this way, and both had the same hole: the
+ * render outlives the request, the gateway cuts the connection at 300s, and GPU
+ * time that was already paid for is thrown away. Hosted providers (Fal) are
+ * fast enough to stay synchronous.
+ */
+interface AsyncVideoBackend {
+  submitVideo(params: {
+    prompt: string
+    model: string
+    imageUrl: string
+    duration: number
+    options?: ReturnType<typeof videoRequest>['options']
+  }): Promise<string>
+  collectVideo(
+    taskId: string,
+    params: { model: string; duration: number; options?: ReturnType<typeof videoRequest>['options'] },
+    opts?: { queuedForMs?: number }
+  ): Promise<GenerationResult | null>
+}
+
+/**
+ * Whether an error while collecting means the render is dead, as opposed to the
+ * status call having had a bad moment.
+ *
+ * Deliberately a whitelist: anything unrecognised is treated as transient and
+ * polled again, because the cost of guessing wrong in that direction is a
+ * slower answer, while guessing wrong in the other direction throws away a
+ * generation that is still running and still being billed.
+ */
+const TERMINAL_RENDER_ERRORS = [
+  /RunPod job (FAILED|CANCELLED|TIMED_OUT)/i,
+  /job not found/i,
+  /endpoint can't run this job/i,
+  /Beam task (ERROR|FAILED|TIMEOUT|CANCELLED|EXPIRED)/i,
+  /Beam worker:/i,
+  /ComfyUI returned no video/i,
+  /completed but returned no output/i,
+  /no readable result/i,
+]
+
+function isTerminalRenderError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return TERMINAL_RENDER_ERRORS.some((re) => re.test(message))
+}
+
+function asyncVideoBackend(model: string): AsyncVideoBackend | null {
+  if (isBeamModel(model)) return getBeamProvider()
+  if (isRunPodModel(model)) {
+    const runpod = getRunPodProvider()
+    return runpod.supportsAsyncVideo(model) ? runpod : null
+  }
+  return null
+}
+
+/**
+ * The video path for a backend that renders asynchronously.
+ *
+ * Without a `taskId` it queues the render and returns the id; with one it looks
+ * for the result. Either way the request returns in seconds, so the GPU work is
+ * no longer coupled to an HTTP connection anything can cut.
+ */
+async function runVideoAsync(
+  backend: AsyncVideoBackend,
+  model: string,
+  prompt: string,
+  files: LabFile[],
+  videoParams: LabVideoParams | undefined,
+  taskId: string | undefined,
+  queuedForMs: number | undefined
+): Promise<
+  | { pending: true; taskId: string }
+  | { pending: false; outputs: LabOutput[]; cost: number; metadata?: Record<string, unknown> }
+> {
+  const { duration, options, source } = videoRequest(model, prompt, files, videoParams)
+
+  if (!taskId) {
+    const id = await backend.submitVideo({ prompt, model, imageUrl: source.url, duration, options })
+    return { pending: true, taskId: id }
+  }
+
+  let res: GenerationResult | null
+  try {
+    res = await backend.collectVideo(taskId, { model, duration, options }, { queuedForMs })
+  } catch (err) {
+    // A poll that fails is not a render that failed. Treating every error as
+    // terminal would reintroduce the bug this path exists to fix — one blip
+    // from the backend's status API and a running generation gets written off.
+    if (!isTerminalRenderError(err)) {
+      console.warn(`[model-lab] transient poll error for ${taskId}, still waiting:`, err)
+      return { pending: true, taskId }
+    }
+    throw err
+  }
+  if (!res) return { pending: true, taskId }
+
+  return {
+    pending: false,
+    outputs: res.url ? [{ kind: 'video', label: `from ${source.name}`, url: res.url }] : [],
     cost: res.cost,
     metadata: res.metadata,
   }
@@ -270,6 +414,33 @@ async function runAudio(model: string, prompt: string, files: LabFile[]) {
   }
 }
 
+/** Assembles the run record the bench displays, from whichever path produced it. */
+async function labResult(
+  result: { outputs: LabOutput[]; cost: number; metadata?: Record<string, unknown> },
+  capability: LabCapability,
+  model: string,
+  startedAt: number
+): Promise<LabRunResult> {
+  const payload: LabRunResult = {
+    ok: true,
+    capability,
+    model,
+    outputs: await externalizeLargeOutputs(result.outputs),
+    provider:
+      capability === 'understanding'
+        ? 'openrouter'
+        : providerForModel(capability as MediaModelType, model),
+    // On the async path this measures the collecting request, not the render;
+    // the client overwrites it with its own elapsed time, and the real GPU time
+    // is in metadata.executionMs either way.
+    ms: Date.now() - startedAt,
+    cost: result.cost,
+    metadata: result.metadata,
+  }
+  console.log(`[model-lab] ${capability} model=${model} ms=${payload.ms} cost=$${payload.cost}`)
+  return payload
+}
+
 /**
  * Runs a single model against raw input (files + text) and reports what came
  * back plus how long it took and what it cost. Deliberately bypasses the graph:
@@ -287,6 +458,10 @@ export async function POST(req: Request) {
       prompt?: string
       files?: LabFile[]
       videoParams?: LabVideoParams
+      /** Present when the client is collecting a render it already queued. */
+      taskId?: string
+      /** When that render was queued — only used to time the capacity check. */
+      startedAt?: number
     }
 
     capability = body.capability ?? 'understanding'
@@ -295,6 +470,27 @@ export async function POST(req: Request) {
     const files = Array.isArray(body.files) ? body.files : []
 
     if (!model) return Response.json({ error: 'model is required' }, { status: 400 })
+
+    // Asynchronous backends short-circuit the whole request/response shape: the
+    // reply is either "queued, here is the id" or "still working", and the run
+    // outlives both.
+    const backend = capability === 'video' ? asyncVideoBackend(model) : null
+    if (backend) {
+      const async = await runVideoAsync(
+        backend,
+        model,
+        prompt,
+        files,
+        body.videoParams,
+        body.taskId,
+        body.startedAt ? Date.now() - body.startedAt : undefined
+      )
+      if (async.pending) {
+        const pending: LabPendingResult = { pending: true, taskId: async.taskId, model, capability }
+        return Response.json(pending, { status: 202 })
+      }
+      return Response.json(await labResult(async, capability, model, startedAt))
+    }
 
     let result: { outputs: LabOutput[]; cost: number; metadata?: Record<string, unknown> }
     switch (capability) {
@@ -317,21 +513,7 @@ export async function POST(req: Request) {
         return Response.json({ error: `Unknown capability "${capability}"` }, { status: 400 })
     }
 
-    const payload: LabRunResult = {
-      ok: true,
-      capability,
-      model,
-      outputs: await externalizeLargeOutputs(result.outputs),
-      provider:
-        capability === 'understanding'
-          ? 'openrouter'
-          : providerForModel(capability as MediaModelType, model),
-      ms: Date.now() - startedAt,
-      cost: result.cost,
-      metadata: result.metadata,
-    }
-    console.log(`[model-lab] ${capability} model=${model} ms=${payload.ms} cost=$${payload.cost}`)
-    return Response.json(payload)
+    return Response.json(await labResult(result, capability, model, startedAt))
   } catch (err) {
     const message = err instanceof Error ? err.message : JSON.stringify(err)
     if (err instanceof BadInput) {

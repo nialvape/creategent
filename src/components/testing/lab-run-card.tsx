@@ -23,6 +23,14 @@ export interface LabRunRecord {
   /** The knobs the run used. Video is the only capability that has any. */
   videoParams?: LabVideoParams
   status: 'running' | 'done' | 'error'
+  /**
+   * Set for a render queued on an async backend. It is the only handle on GPU
+   * work that is already being paid for, so it is persisted to localStorage and
+   * survives a reload — losing it means losing the generation.
+   */
+  taskId?: string
+  /** When the run was submitted, so elapsed time survives a page reload. */
+  startedAt?: number
   result?: LabRunResult
   error?: string
   /** Set once this run has been rated, so the card stops offering it twice. */

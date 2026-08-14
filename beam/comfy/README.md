@@ -9,7 +9,7 @@ them by model id.
 |---|---|---|
 | Primitive | serverless endpoint | **task queue** (endpoints cap at 180s) |
 | GPU | RTX 5090, $0.99/hr | RTX 5090, $0.68/hr |
-| Promotional credit | — | applies (serverless only) |
+| Promotional credit | — | applies (grants are "Serverless only"; a Pod is not) |
 | Results | base64 in the job output, 10 MiB body limit | URLs via `Output.public_url()`, no limit |
 | Cold start | volume-backed, minutes | ~19 min measured on the ltx25 Pod |
 
