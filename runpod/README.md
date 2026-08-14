@@ -70,6 +70,54 @@ Wiring is already done — nothing else to change:
    **Project → Settings → Voice Clone Reference**. Every voiceover in that project
    is then synthesized in that voice.
 
+## The ComfyUI worker (`comfyui/`) speaks a different contract
+
+The other workers take a small purpose-built JSON body. The ComfyUI one takes an
+entire API-format graph plus its input files, so one image can run any workflow:
+
+```jsonc
+// input
+{ "workflow": { /* API-format graph */ },
+  "files": [{ "name": "voice.wav", "data": "<base64>" }] }
+
+// output
+{ "files": [{ "node_id": "12", "key": "audio", "filename": "voice.flac",
+              "mime": "audio/flac", "encoding": "base64", "size": 812345,
+              "data": "<base64 or URL>" }],
+  "values": [{ "node_id": "14", "key": "text", "value": ["..."] }],
+  "images": [ /* the same files, in the legacy shape */ ],
+  "errors": ["..."] }
+```
+
+That contract is implemented once, in `comfy_worker/` at the repo root, and is
+shared with the Beam backend so the two cannot drift. `runpod/comfyui/handler.py`
+is a thin RunPod entrypoint over it — the stock `worker-comfyui` handler is kept
+in the image as `/upstream_handler.py` and everything except the job body is
+imported from it.
+
+**Why we override the stock handler at all:** it reads `node_output["images"]`
+and logs every other key as "unhandled output keys" before dropping it. LTX-2.5
+only works on it by luck, because `SaveVideo` reports its mp4 through
+`PreviewVideo`, which writes under `images`. A graph with a `SaveAudio` node
+returns success with nothing in it. Inputs were never the problem: ComfyUI's
+`/upload/image` writes raw bytes under the filename it is given and never looks
+at them, so audio and video always rode that channel fine.
+
+**Both sides are compatible in both directions.** The worker accepts `images` as
+an alias for `files`; the app (`src/lib/comfy/transport.ts`) reads `files` when
+present and falls back to `images`. So the image and the app can be redeployed
+independently. What the app sends is declared per endpoint by `contract` in
+`src/providers/runpod.ts`, and only one key is ever sent — putting the same
+base64 under both would double the payload against RunPod's 10 MiB body limit.
+
+> **After rebuilding the endpoint from `runpod/comfyui/Dockerfile`,** flip that
+> endpoint's `contract` to `'generic'` (or set `RUNPOD_COMFYUI_CONTRACT=generic`).
+> Until then the worker is still the stock one and non-image outputs are
+> discarded on the GPU, whatever the app asks for.
+>
+> RunPod's GitHub builder may keep serving the previous image after a push —
+> terminate the stale worker in the Console to force the new one.
+
 ## Heads-up: Spanish voiceovers
 
 Base Chatterbox is English-only. For Spanish (and the gym-girl idea is in Spanish),

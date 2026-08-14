@@ -1,4 +1,3 @@
-import sharp from 'sharp'
 import { withRetry } from '@/lib/retry'
 import {
   buildLtxI2vWorkflow,
@@ -7,6 +6,15 @@ import {
   LTX_DEFAULTS,
   type LtxAspectRatio,
 } from '@/lib/comfy/ltx-2-5-i2v'
+import { encodeImageInput } from '@/lib/comfy/files'
+import {
+  comfyFileUrl,
+  comfyJobInput,
+  describeComfyOutput,
+  normalizeComfyOutput,
+  pickComfyFile,
+  type ComfyContract,
+} from '@/lib/comfy/transport'
 import type {
   MediaProvider,
   AudioProvider,
@@ -24,13 +32,11 @@ import type {
  *     chatterbox  in  { text, reference_audio_b64? }                 -> { audio_b64, sample_rate }
  *     musetalk    in  { image_url, audio_b64 }                       -> { video_b64 }
  *
- *   kind 'comfy' — the stock runpod/worker-comfyui handler, which takes an
- *     entire ComfyUI API-format graph:
- *       in  { workflow, images: [{ name, image }] }
- *       out { images: [{ filename, type: 'base64', data }] }
- *     Note the output key is `images` even for video: ComfyUI's SaveVideo
- *     reports through PreviewVideo, which writes under "images". The mp4 comes
- *     back base64 in `data` with an .mp4 filename.
+ *   kind 'comfy' — a ComfyUI worker, which takes an entire API-format graph
+ *     plus its input files. The shape lives in `@/lib/comfy/transport`, and is
+ *     shared with the Beam backend running the same worker code. It tolerates
+ *     the stock runpod/worker-comfyui handler too, which understands only
+ *     `images` in both directions.
  *
  * Endpoints are async: POST /run returns a job id, then we poll /status/{id}
  * until COMPLETED. Cost is billed per GPU-second, so we derive actual_cost from
@@ -42,20 +48,13 @@ const RUNPOD_BASE = 'https://api.runpod.ai/v2'
 /** RunPod rejects a larger /run body with a 400 before the worker ever sees it. */
 const RUNPOD_MAX_BODY_BYTES = 10 * 1024 * 1024
 
-/**
- * Long side the first frame is downscaled to before it goes into the payload.
- * The graph already rescales it to exactly this (ResizeImageMaskNode, node
- * 398:351) before it conditions anything, so every pixel above this is thrown
- * away on the worker — after being base64-inflated by a third and counted
- * against the 10 MiB body limit. A phone photo alone can blow that limit.
- */
-const FIRST_FRAME_MAX_SIDE = 1536
-
 interface EndpointDef {
   envKey: string
   defaultId: string
   gpuUsdPerSec: number
   kind: 'simple' | 'comfy'
+  /** Which worker build is deployed there. Only meaningful when kind is 'comfy'. */
+  contract?: ComfyContract
 }
 
 // Model id -> serverless endpoint id. Overridable via env so the ids aren't
@@ -70,6 +69,11 @@ const ENDPOINTS: Record<string, EndpointDef> = {
     // 6000 at $2.09/hr. Re-add that pool only alongside a rate change here.
     gpuUsdPerSec: 0.000275,
     kind: 'comfy',
+    // The deployed image still carries the stock handler. Flip to 'generic'
+    // (or set RUNPOD_COMFYUI_CONTRACT=generic) once the endpoint has rebuilt
+    // from runpod/comfyui/Dockerfile — until then, audio and text outputs are
+    // dropped by the worker no matter what the app asks for.
+    contract: 'legacy',
   },
   'runpod/wan-2.6-i2v': {
     envKey: 'RUNPOD_WAN_ENDPOINT_ID',
@@ -109,11 +113,21 @@ export function videoEndpointId(): string {
   return process.env[def.envKey] || def.defaultId
 }
 
-function endpointFor(model: string): { id: string; gpuUsdPerSec: number; kind: EndpointDef['kind'] } {
+function endpointFor(model: string): {
+  id: string
+  gpuUsdPerSec: number
+  kind: EndpointDef['kind']
+  contract: ComfyContract
+} {
   const def = ENDPOINTS[model]
   if (!def) throw new Error(`Unknown RunPod model "${model}"`)
   const id = process.env[def.envKey] || def.defaultId
-  return { id, gpuUsdPerSec: def.gpuUsdPerSec, kind: def.kind }
+  // Env override so the app can follow a worker rebuild without a code deploy.
+  const contract: ComfyContract =
+    process.env.RUNPOD_COMFYUI_CONTRACT === 'generic'
+      ? 'generic'
+      : def.contract ?? 'legacy'
+  return { id, gpuUsdPerSec: def.gpuUsdPerSec, kind: def.kind, contract }
 }
 
 interface RunStatus {
@@ -306,8 +320,8 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     maxAttempts?: number
     options?: VideoOptions
   }): Promise<GenerationResult> {
-    const { id, gpuUsdPerSec, kind } = endpointFor(params.model)
-    if (kind === 'comfy') return this.generateVideoViaComfy(params, id, gpuUsdPerSec)
+    const { id, gpuUsdPerSec, kind, contract } = endpointFor(params.model)
+    if (kind === 'comfy') return this.generateVideoViaComfy(params, id, gpuUsdPerSec, contract)
 
     return withRetry(async () => {
       const { output, executionMs } = await this.runJob(id, {
@@ -330,10 +344,11 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
   }
 
   /**
-   * Video through the stock worker-comfyui handler: send the whole graph plus
-   * the first frame inline, get an mp4 back base64. Not retried by default —
-   * a run costs minutes of GPU time, so a silent second attempt would double a
-   * real bill to work around what is usually a deterministic graph error.
+   * Video through a ComfyUI worker: send the whole graph plus its input files,
+   * get back everything the graph produced and keep the video. Not retried by
+   * default — a run costs minutes of GPU time, so a silent second attempt would
+   * double a real bill to work around what is usually a deterministic graph
+   * error.
    */
   private async generateVideoViaComfy(
     params: {
@@ -345,17 +360,18 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
       options?: VideoOptions
     },
     endpointId: string,
-    gpuUsdPerSec: number
+    gpuUsdPerSec: number,
+    contract: ComfyContract
   ): Promise<GenerationResult> {
     const opts = params.options ?? {}
     const aspectRatio = (opts.aspectRatio as LtxAspectRatio) ?? '16:9 (Widescreen)'
     const megapixels = opts.megapixels ?? LTX_DEFAULTS.megapixels
     const fps = opts.fps ?? LTX_DEFAULTS.fps
 
-    const { name: imageName, base64: imageB64 } = await encodeFirstFrame(params.imageUrl)
+    const firstFrame = await encodeImageInput(params.imageUrl, 'first_frame')
     const workflow = buildLtxI2vWorkflow({
       prompt: params.prompt,
-      imageName,
+      imageName: firstFrame.name,
       aspectRatio,
       megapixels,
       durationSec: params.duration,
@@ -368,28 +384,30 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
     return withRetry(async () => {
       const { output, executionMs } = await this.runJob(
         endpointId,
-        { workflow, images: [{ name: imageName, image: imageB64 }] },
+        comfyJobInput(workflow, [firstFrame], contract),
         // Two sampling stages plus a tiled VAE decode: minutes, not seconds.
         { timeoutMs: 25 * 60_000, pollMs: 5_000 }
       )
 
-      // Non-fatal problems (a failed S3 upload, a dropped output) arrive here
-      // rather than as a job failure — surface them instead of silently
-      // returning an empty result.
-      const errors = output.errors as string[] | undefined
+      const result = normalizeComfyOutput(output)
 
-      const images = output.images as Array<{ filename?: string; type?: string; data?: string }> | undefined
-      const video = images?.find((i) => i.filename?.toLowerCase().endsWith('.mp4')) ?? images?.[0]
-      if (!video?.data) {
-        throw new Error(
-          `ComfyUI returned no video${errors?.length ? `: ${errors.join('; ')}` : ''}`
-        )
+      // Match on MIME, not on the node key: LTX's mp4 arrives under `images`
+      // because SaveVideo reports through PreviewVideo.
+      const video = pickComfyFile(result.files, 'video/')
+      if (!video) {
+        // Non-fatal problems (a failed upload, a dropped output) arrive in the
+        // result rather than as a job failure, and a graph that produced only
+        // audio is a real thing to say out loud.
+        throw new Error(`ComfyUI returned no video — got ${describeComfyOutput(result)}`)
       }
+
+      // Anything else the graph emitted (a separate audio track, a caption)
+      // rides along in metadata instead of being dropped on the floor.
+      const extras = result.files.filter((f) => f !== video)
 
       const { width, height } = resolveDimensions(aspectRatio, megapixels)
       return {
-        // s3_url means the worker has S3 configured; otherwise it's raw base64.
-        url: video.type === 's3_url' ? video.data : `data:video/mp4;base64,${video.data}`,
+        url: comfyFileUrl(video),
         cost: (executionMs / 1000) * gpuUsdPerSec,
         model: params.model,
         provider: 'runpod',
@@ -402,7 +420,11 @@ export class RunPodAdapter implements MediaProvider, AudioProvider {
           aspectRatio,
           megapixels,
           fps,
-          errors,
+          errors: result.errors.length ? result.errors : undefined,
+          extraFiles: extras.length
+            ? extras.map((f) => ({ filename: f.filename, mime: f.mime, size: f.size }))
+            : undefined,
+          values: result.values.length ? result.values : undefined,
         },
       }
     }, params.maxAttempts ?? 1)
@@ -486,38 +508,3 @@ export async function fetchAsBase64(url: string): Promise<string> {
   return buf.toString('base64')
 }
 
-/**
- * Prepares the first frame for the ComfyUI payload: downscaled to what the
- * graph keeps and re-encoded as JPEG, then base64'd.
- *
- * JPEG rather than the original PNG because LTXVPreprocess (node 398:350) runs
- * the frame through JPEG compression at quality 18 anyway — holding out for
- * lossless bytes buys nothing and costs an order of magnitude in payload size.
- * EXIF orientation is baked in first, or a portrait photo would arrive on its
- * side; alpha is flattened onto white, since JPEG has none.
- */
-async function encodeFirstFrame(url: string): Promise<{ name: string; base64: string }> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`Failed to fetch the first frame (${res.status})`)
-  const original = Buffer.from(await res.arrayBuffer())
-
-  try {
-    const jpeg = await sharp(original)
-      .rotate()
-      .resize({
-        width: FIRST_FRAME_MAX_SIDE,
-        height: FIRST_FRAME_MAX_SIDE,
-        fit: 'inside',
-        withoutEnlargement: true,
-      })
-      .flatten({ background: '#ffffff' })
-      .jpeg({ quality: 95, mozjpeg: true })
-      .toBuffer()
-    return { name: 'first_frame.jpg', base64: jpeg.toString('base64') }
-  } catch (err) {
-    // An unreadable or exotic format shouldn't block the run — send it as-is and
-    // let the body-size guard explain if it turns out to be too big.
-    console.warn('[runpod] could not downscale the first frame, sending it as-is:', err)
-    return { name: 'first_frame.png', base64: original.toString('base64') }
-  }
-}

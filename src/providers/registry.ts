@@ -2,12 +2,14 @@ import { OpenRouterAdapter } from './openrouter'
 import { FalAdapter } from './fal'
 import { ElevenLabsAdapter } from './elevenlabs'
 import { RunPodAdapter, isRunPodModel } from './runpod'
+import { BeamAdapter, isBeamModel } from './beam'
 import type { LLMProvider, MediaProvider, AudioProvider } from '@/types/provider'
 
 let llmProvider: LLMProvider | null = null
 let mediaProvider: MediaProvider | null = null
 let audioProvider: AudioProvider | null = null
 let runpodProvider: RunPodAdapter | null = null
+let beamProvider: BeamAdapter | null = null
 
 export function getLLMProvider(): LLMProvider {
   if (!llmProvider) {
@@ -27,11 +29,27 @@ function getRunPodProvider(): RunPodAdapter {
   return runpodProvider
 }
 
+function getBeamProvider(): BeamAdapter {
+  if (!beamProvider) {
+    const token = process.env.BEAM_TOKEN
+    if (!token) throw new Error('BEAM_TOKEN is not set')
+    beamProvider = new BeamAdapter(token)
+  }
+  return beamProvider
+}
+
 /**
  * Media (image/video/avatar) provider. Routes by the asset's model id: a
- * `runpod/*` model goes to the user's GPU endpoints, everything else to Fal.
+ * `runpod/*` or `beam/*` model goes to the matching self-hosted GPU backend,
+ * everything else to Fal.
+ *
+ * The two self-hosted backends run the same ComfyUI graphs (see
+ * `src/lib/comfy/transport.ts`), so `runpod/ltx-2.5-i2v` and `beam/ltx-2.5-i2v`
+ * are the same model on different hardware — picking one is a cost and
+ * availability decision, not a quality one.
  */
 export function getMediaProvider(model?: string): MediaProvider {
+  if (isBeamModel(model)) return getBeamProvider()
   if (isRunPodModel(model)) return getRunPodProvider()
   if (!mediaProvider) {
     const apiKey = process.env.FAL_KEY

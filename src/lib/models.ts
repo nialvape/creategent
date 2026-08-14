@@ -128,6 +128,14 @@ export const VIDEO_MODELS: ModelDef[] = [
     priceLabel: '~$0.11/5s',
   },
   {
+    id: 'beam/ltx-2.5-i2v',
+    name: 'LTX 2.5 distilled (Beam)',
+    provider: 'Beam (self-hosted)',
+    description:
+      'The same graph and weights as the RunPod entry, on Beam serverless. Cheaper per GPU-hour ($0.68 vs $0.99 for an RTX 5090) and covered by promotional credit; cold starts are slower.',
+    priceLabel: '~$0.08/5s',
+  },
+  {
     id: 'runpod/wan-2.6-i2v',
     name: 'Wan 2.6 (RunPod)',
     provider: 'RunPod (self-hosted)',
@@ -278,12 +286,13 @@ export function coerceMediaModel(type: MediaModelType, model: string | undefined
 }
 
 /**
- * The execution provider for a media model id. RunPod (`runpod/*`) models run on
- * the user's own GPU endpoints; everything else uses the type's cloud default
- * (Fal for image/video/avatar, ElevenLabs for audio). This is what gets stamped
- * on the asset and used to route to the right adapter in the registry.
+ * The execution provider for a media model id. `runpod/*` and `beam/*` models
+ * run on the user's own serverless GPUs; everything else uses the type's cloud
+ * default (Fal for image/video/avatar, ElevenLabs for audio). This is what gets
+ * stamped on the asset and used to route to the right adapter in the registry.
  */
 export function providerForModel(type: MediaModelType, model: string): string {
   if (model?.startsWith('runpod/')) return 'runpod'
+  if (model?.startsWith('beam/')) return 'beam'
   return type === 'audio' ? 'elevenlabs' : 'fal'
 }

@@ -39,3 +39,12 @@ RUN cd "$COMFYUI_PATH" \
 # extra_model_paths.yaml points ComfyUI at the volume so the image stays small
 # and the same weights can back several endpoints.
 COPY runpod/comfyui/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
+
+# Our handler replaces the stock one, which only ever returns a node's `images`
+# output and drops audio, video and text with a log line. Keep the original
+# alongside it: everything except the job body is imported from it, so this is a
+# thin override rather than a fork. `/start.sh` runs `/handler.py`, so the swap
+# needs no change to the entrypoint.
+RUN cp /handler.py /upstream_handler.py
+COPY comfy_worker /comfy_worker
+COPY runpod/comfyui/handler.py /handler.py

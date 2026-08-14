@@ -46,3 +46,11 @@ plan*.txt
 pid*.txt
 proj*.json
 *.wav
+
+# python
+__pycache__/
+*.pyc
+
+# Copied out of the repo root by beam/comfy/app.py at deploy time, because Beam
+# syncs only the deploy directory. The root copy is the source of truth.
+beam/comfy/comfy_worker/

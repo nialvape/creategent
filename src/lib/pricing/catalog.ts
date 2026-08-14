@@ -15,7 +15,12 @@ export const PRICING_CATALOG: PricingEntry[] = [
   { provider: 'elevenlabs', model: 'eleven_turbo_v2_5', unitType: 'per_1k_characters', priceUsd: 0.18 },
   // RunPod self-hosted (billed per GPU-second; these are rough planner ESTIMATES —
   // actual_cost is derived at runtime from the endpoint's reported executionTime)
+  { provider: 'runpod', model: 'runpod/ltx-2.5-i2v', unitType: 'per_5s_segment', priceUsd: 0.11, notes: 'LTX 2.5 distilled on RTX 5090 ($0.99/hr), measured' },
   { provider: 'runpod', model: 'runpod/wan-2.6-i2v', unitType: 'per_5s_segment', priceUsd: 0.10, notes: 'wan 2.6 i2v on H100 (est.)' },
+  // Beam runs the same LTX graph on a cheaper RTX 5090 ($0.68/hr). Scaled from
+  // the measured RunPod figure by the hourly rate; a cold start is NOT in this
+  // number, and on Beam that is ~19 min of billed weight loading.
+  { provider: 'beam', model: 'beam/ltx-2.5-i2v', unitType: 'per_5s_segment', priceUsd: 0.08, notes: 'LTX 2.5 distilled on Beam RTX 5090 ($0.68/hr), est. from RunPod timing' },
   { provider: 'runpod', model: 'runpod/chatterbox', unitType: 'per_1k_characters', priceUsd: 0.01, notes: 'Chatterbox TTS on RTX 5090 (est.)' },
   // OpenRouter LLMs
   { provider: 'openrouter', model: 'anthropic/claude-sonnet-4-6', unitType: 'per_1k_tokens', priceUsd: 0.003 },
