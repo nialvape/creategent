@@ -244,7 +244,7 @@ export function ExportRatingsDialog({ onClose }: { onClose: () => void }) {
             </label>
 
             <p className="font-mono text-[10px] text-white/40">
-              {filtered.length} rating{filtered.length === 1 ? '' : 's'} match
+              {filtered.length === 1 ? '1 rating matches' : `${filtered.length} ratings match`}
             </p>
           </div>
         )}
