@@ -30,7 +30,7 @@ file instead of starting over.
 import json
 import sys
 
-from beam import Image, Volume, function, task_queue
+from beam import Image, Output, Volume, function, task_queue
 
 VOLUME_NAME = "ltx25-models"
 MOUNT_PATH = "/models"
@@ -77,7 +77,7 @@ def _download(models):
             # ingest_workflow.py reports these too, but a manifest can be edited
             # by hand — say which file is unreachable rather than skipping quietly.
             print("  SKIP  %s (no URL in the manifest)" % name)
-            failed.append(name)
+            failed.append({"name": name, "url": None, "http": None, "aria2": None})
             continue
 
         dest_dir = Path(MOUNT_PATH) / directory
@@ -117,19 +117,45 @@ def _download(models):
             "--dir=%s" % dest_dir,
             "--out=%s" % name,
         ]
-        # Auth is per host, and it has to be a header for HF: a token in the
-        # query string works for civitai and is rejected by huggingface.co.
+        # Auth is per host, and the two sites want it in different places.
+        #
+        # Hugging Face takes a bearer header and rejects a token in the query
+        # string. civitai's *download* endpoint is the other way round: the
+        # header produced a flat 403 on a model that downloads fine with
+        # `?token=` (measured 2026-08-20). Their API docs describe the query
+        # parameter for downloads, so this follows the endpoint, not the API.
         if hf_token and host.endswith("huggingface.co"):
             cmd.append("--header=Authorization: Bearer %s" % hf_token)
         if civitai_token and "civitai" in host:
-            cmd.append("--header=Authorization: Bearer %s" % civitai_token)
+            separator = "&" if "?" in url else "?"
+            url = "%s%stoken=%s" % (url, separator, civitai_token)
         cmd.append(url)
 
         print("  get   %s  <- %s" % (name, host))
         result = subprocess.run(cmd)
         if result.returncode != 0:
-            print("  FAIL  %s (aria2c exit %d)" % (name, result.returncode))
-            failed.append(name)
+            # aria2's exit code says "it did not work", never why, and the
+            # container log is not readable from a laptop (`beam logs` dies on
+            # SSL here). Asking the server once more with the same headers turns
+            # that into an HTTP status — which is the difference between a bad
+            # URL (404), a token problem (401/403), and a page where a file was
+            # expected (200 of text/html).
+            status = _probe(url, cmd)
+            print("  FAIL  %s (aria2c exit %d, server said %s)" % (name, result.returncode, status))
+            failed.append(
+                {
+                    "name": name,
+                    # The URL is echoed back with any token stripped: it is shown
+                    # in the UI, and a credential in an error message is a
+                    # credential in a screenshot.
+                    "url": url.split("?token=")[0].split("&token=")[0],
+                    "http": status,
+                    "aria2": result.returncode,
+                    # Length only, never the value. Distinguishes "no secret" and
+                    # "truncated secret" from "the site said no".
+                    "authLen": len(civitai_token or "") if "civitai" in host else None,
+                }
+            )
 
     print("\nVolume contents:")
     for path in sorted(Path(MOUNT_PATH).rglob("*")):
@@ -137,8 +163,52 @@ def _download(models):
             print("  %7.2f GB  %s" % (path.stat().st_size / 1e9, path.relative_to(MOUNT_PATH)))
 
     if failed:
-        print("\n%d file(s) did not land: %s" % (len(failed), ", ".join(map(str, failed))))
-    return {"failed": failed}
+        print("\n%d file(s) did not land: %s" % (len(failed), ", ".join(f["name"] for f in failed)))
+    return _returned({"failed": failed, "requested": len(models)})
+
+
+def _probe(url, cmd):
+    """The HTTP status the server returns for `url`, using the same auth headers."""
+    import urllib.error
+    import urllib.request
+
+    headers = {}
+    for arg in cmd:
+        if arg.startswith("--header="):
+            key, _, value = arg[len("--header=") :].partition(": ")
+            headers[key] = value
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=30
+        ) as res:
+            return res.status
+    except urllib.error.HTTPError as err:
+        return err.code
+    except Exception as err:  # noqa: BLE001
+        return "%s: %s" % (type(err).__name__, err)
+
+
+def _returned(result):
+    """Return the result AND leave a copy behind as a retrievable file.
+
+    `GET /v2/task/{id}/` does not echo a handler's return value — measured
+    2026-08-19. Without this the weights panel can only report that a task
+    finished, never "this file failed with 403", which is the only part worth
+    knowing when a download goes wrong. Same reasoning, and same shape, as
+    `_returned` in beam/comfy/app.py.
+    """
+    import json
+    import os
+    import tempfile
+
+    try:
+        path = os.path.join(tempfile.mkdtemp(prefix="weights-"), "result.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(result, handle)
+        Output(path=path).save()
+    except Exception as err:  # noqa: BLE001
+        print("weights-downloader - could not save result.json: %s" % err)
+    return result
 
 
 # The same job, reachable two ways, because it has two callers and neither

@@ -315,23 +315,83 @@ async function preflight(body: Record<string, unknown>) {
   })
 }
 
+/**
+ * Turn a civitai page link into its download endpoint.
+ *
+ * Pasting the address bar is the natural thing to do, and what comes out is
+ * `https://civitai.com/models/<id>/<slug>?modelVersionId=<vid>` — an HTML page.
+ * aria2 asks for it and civitai answers 403, which reads like an auth problem
+ * and is not: the file lives at `/api/download/models/<vid>`.
+ *
+ * `civitai.red` (and other mirrors of the same site) are normalised to
+ * civitai.com, because the API path is what serves the bytes.
+ *
+ * Anything that already looks like a download URL is left exactly as it is.
+ */
+function normalizeSourceUrl(raw: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return raw
+  }
+
+  const host = parsed.hostname.toLowerCase()
+  if (!/(^|\.)civitai\.[a-z]+$/.test(host)) return raw
+  if (parsed.pathname.startsWith('/api/download/')) {
+    parsed.hostname = 'civitai.com'
+    return parsed.toString()
+  }
+
+  // The version id is what identifies a downloadable file; a model can have
+  // many. Prefer the explicit query parameter, and fall back to the path form
+  // civitai also uses.
+  const versionId =
+    parsed.searchParams.get('modelVersionId') ??
+    parsed.pathname.match(/\/model-versions\/(\d+)/)?.[1]
+  if (!versionId) {
+    // Failing here beats letting aria2 fetch an HTML page and report 403, which
+    // reads like a credentials problem and sends you looking in the wrong place.
+    throw new BadInput(
+      'That civitai link has no model version in it. Open the version you want on the ' +
+        'page and copy the URL again — it should carry `?modelVersionId=…`.'
+    )
+  }
+
+  return `https://civitai.com/api/download/models/${versionId}`
+}
+
 function asManifest(value: unknown): DownloadEntry[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new BadInput('nothing to download')
   }
   return value.map((raw) => {
     const entry = (raw ?? {}) as Record<string, unknown>
-    const url = typeof entry.url === 'string' ? entry.url.trim() : ''
-    const directory = typeof entry.directory === 'string' ? entry.directory.trim() : ''
+    const url = normalizeSourceUrl(typeof entry.url === 'string' ? entry.url.trim() : '')
+    let directory = typeof entry.directory === 'string' ? entry.directory.trim() : ''
     let name = typeof entry.name === 'string' ? entry.name.trim() : ''
 
     if (!url) throw new BadInput('every entry needs a url')
     if (!directory) throw new BadInput('every entry needs a target folder')
-    if (!(WORKER_MODEL_DIRS as readonly string[]).includes(directory)) {
+
+    // Subfolders are allowed, and they are not a nicety: workflows routinely name
+    // a model as `ZIT\Z-Image Turbo bf16.safetensors` because that is how the
+    // author had it filed, and ComfyUI shows the loader value with that prefix.
+    // Put the file anywhere else and the graph will not find it.
+    //
+    // Only the FIRST segment has to be a folder the worker maps, and the rest is
+    // checked for traversal rather than membership.
+    const normalized = directory.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    const [root, ...rest] = normalized.split('/')
+    if (!(WORKER_MODEL_DIRS as readonly string[]).includes(root)) {
       throw new BadInput(
-        `"${directory}" is not a folder the worker maps. The loaders would never see the file.`
+        `"${root}" is not a folder the worker maps. The loaders would never see the file.`
       )
     }
+    if (rest.some((segment) => segment === '..' || segment === '.' || segment === '')) {
+      throw new BadInput(`"${directory}" is not a valid subfolder path`)
+    }
+    directory = normalized
     if (!name) {
       // civitai's links are /api/download/models/<id> with no filename, so the
       // fallback lands on the bare id with no extension and ComfyUI will not

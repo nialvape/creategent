@@ -65,6 +65,11 @@ interface JobState {
   queued: number
 }
 
+/** Stable identity for a row: a workflow can name the same file in two folders. */
+function keyOf(m: { directory: string; name: string }): string {
+  return `${m.directory}/${m.name}`
+}
+
 function formatBytes(bytes: number | null | undefined): string {
   if (!bytes) return '—'
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`
@@ -77,6 +82,13 @@ export function WeightsPanel() {
   const [workflows, setWorkflows] = useState<WorkflowFile[]>([])
   const [configured, setConfigured] = useState(true)
   const [preflight, setPreflight] = useState<PreflightState | null>(null)
+  // Which rows the Download button will actually fetch.
+  //
+  // Not a nicety: a workflow routinely names a variant of something already on
+  // the volume — an int8 text encoder when the nvfp4 build is there, the
+  // unpruned transformer when the pruned one is — and an all-or-nothing button
+  // makes 27 GB of that the price of the 21 GB you wanted.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const [job, setJob] = useState<JobState | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -129,8 +141,12 @@ export function WeightsPanel() {
       try {
         const data = (await post({ action: 'preflight', ...payload })) as unknown as PreflightState
         setPreflight(data)
+        // Everything downloadable starts selected: the common case is wanting
+        // all of it, and unchecking is a cheaper mistake than forgetting to check.
+        setSelected(new Set(data.report.models.filter((m) => m.url).map(keyOf)))
       } catch (err) {
         setPreflight(null)
+        setSelected(new Set())
         setError(err instanceof Error ? err.message : String(err))
       } finally {
         setBusy(false)
@@ -213,6 +229,8 @@ export function WeightsPanel() {
   }, [job, post])
 
   const downloadable = preflight?.report.models.filter((m) => m.url) ?? []
+  const chosen = downloadable.filter((m) => selected.has(keyOf(m)))
+  const chosenBytes = chosen.reduce((sum, m) => sum + (m.size ?? 0), 0)
 
   return (
     <section className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
@@ -371,18 +389,69 @@ export function WeightsPanel() {
 
       {preflight && tab === 'workflow' && (
         <div className="space-y-2 border-t border-white/5 pt-3">
+          <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-white/25">
+            <span>{chosen.length} of {downloadable.length} selected</span>
+            <button
+              type="button"
+              className="ml-auto transition-colors hover:text-white/60"
+              onClick={() => setSelected(new Set(downloadable.map(keyOf)))}
+            >
+              all
+            </button>
+            <button
+              type="button"
+              className="transition-colors hover:text-white/60"
+              onClick={() => setSelected(new Set())}
+            >
+              none
+            </button>
+          </div>
+
           <div className="space-y-1">
-            {preflight.report.models.map((m) => (
-              <div key={`${m.directory}/${m.name}`} className="flex items-center gap-2 text-[11px]">
-                <span className="w-32 shrink-0 truncate font-mono text-white/30">{m.directory}</span>
-                <span className={cn('truncate', m.url ? 'text-white/70' : 'text-amber-300/80')}>
-                  {m.name}
-                </span>
-                <span className="ml-auto shrink-0 text-white/30">
-                  {m.url ? formatBytes(m.size) : 'no URL'}
-                </span>
-              </div>
-            ))}
+            {preflight.report.models.map((m) => {
+              const key = keyOf(m)
+              const isSelected = selected.has(key)
+              return (
+                <label
+                  key={key}
+                  className={cn(
+                    'flex items-center gap-2 rounded-lg px-1 py-0.5 text-[11px]',
+                    m.url ? 'cursor-pointer hover:bg-white/[0.03]' : 'cursor-default'
+                  )}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    // A row with no URL cannot be fetched by anything here, so it
+                    // is shown for what it is rather than offered as a choice.
+                    disabled={!m.url}
+                    onChange={() =>
+                      setSelected((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(key)) next.delete(key)
+                        else next.add(key)
+                        return next
+                      })
+                    }
+                    className="h-3 w-3 shrink-0 accent-indigo-500 disabled:opacity-20"
+                  />
+                  <span className="w-32 shrink-0 truncate font-mono text-white/30">
+                    {m.directory}
+                  </span>
+                  <span
+                    className={cn(
+                      'truncate',
+                      !m.url ? 'text-amber-300/80' : isSelected ? 'text-white/70' : 'text-white/35'
+                    )}
+                  >
+                    {m.name}
+                  </span>
+                  <span className="ml-auto shrink-0 text-white/30">
+                    {m.url ? formatBytes(m.size) : 'no URL'}
+                  </span>
+                </label>
+              )
+            })}
           </div>
 
           {preflight.report.packs.length > 0 && (
@@ -412,13 +481,14 @@ export function WeightsPanel() {
 
           <button
             type="button"
-            disabled={busy || downloadable.length === 0}
-            onClick={() => void startDownload(downloadable)}
+            disabled={busy || chosen.length === 0}
+            onClick={() => void startDownload(chosen)}
             className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-indigo-600/80 px-3 py-2 text-[11px] font-medium text-white transition-colors hover:bg-indigo-600 disabled:opacity-40"
           >
             {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <HardDriveDownload className="h-3 w-3" />}
-            Download {downloadable.length} file{downloadable.length === 1 ? '' : 's'} (
-            {formatBytes(preflight.totalBytes)})
+            {chosen.length === 0
+              ? 'Nothing selected'
+              : `Download ${chosen.length} file${chosen.length === 1 ? '' : 's'} (${formatBytes(chosenBytes)})`}
           </button>
         </div>
       )}
