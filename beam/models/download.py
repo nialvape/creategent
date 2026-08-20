@@ -23,8 +23,11 @@ no reason to hold a 5090 while 40 GB transfers. Volume storage is free under
 1 TB, so anything parked here costs nothing between sessions.
 
 aria2c rather than a plain streaming GET: on a 20 GB file, sixteen connections is
-the difference between minutes and most of an hour, and it resumes a partial
-file instead of starting over.
+the difference between minutes and most of an hour. It downloads to container
+disk and the result is copied to the volume in one sequential pass, because
+aria2's parallel range writes silently corrupt files on this volume — see the
+long comment in the loop. Every safetensors file is checked before and after
+that copy; a bad one is refused rather than published.
 """
 
 import json
@@ -58,7 +61,9 @@ CONFIG = dict(
 
 def _download(models):
     import os
+    import shutil
     import subprocess
+    import tempfile
     from pathlib import Path
     from urllib.parse import urlparse
 
@@ -87,25 +92,48 @@ def _download(models):
         if dest.exists() and dest.stat().st_size > 0:
             actual = dest.stat().st_size
             expected = entry.get("size")
-            if not expected:
-                # The host would not report a Content-Length. Existence is the
-                # only check available, and it cannot catch a truncated file.
-                print("  skip? %s (%.2f GB, present; size unverified)" % (name, actual / 1e9))
+
+            # Integrity first, size second. Size is the weaker test and it was
+            # the only one here when two files with the exactly correct byte
+            # count turned out to be full of holes — and were then skipped as
+            # "already present" on every subsequent run.
+            broken = _verify(str(dest))
+            if broken:
+                print("  redo  %s (on the volume but %s)" % (name, broken))
+                dest.unlink()
+            elif not expected:
+                print("  skip  %s (%.2f GB, present and intact)" % (name, actual / 1e9))
                 continue
-            if abs(actual - expected) / expected < 0.02:
+            elif abs(actual - expected) / expected < 0.02:
                 print("  skip  %s (%.2f GB, already present)" % (name, actual / 1e9))
                 continue
-            # A partial file from an interrupted run. aria2c --continue would
-            # resume it, which is right when the remainder is genuinely missing
-            # and wrong when the file is corrupt in place; resuming is the cheap
-            # bet on a 20 GB weight, and a size mismatch afterwards will show up
-            # here again on the next run.
-            print(
-                "  resume %s (%.2f GB of %.2f GB)"
-                % (name, actual / 1e9, expected / 1e9)
-            )
+            else:
+                # Right shape, wrong size: an interrupted copy. It is staged
+                # from scratch rather than resumed in place — the volume copy is
+                # append-only by design and there is nothing here worth saving.
+                print(
+                    "  redo  %s (%.2f GB of %.2f GB)"
+                    % (name, actual / 1e9, expected / 1e9)
+                )
+                dest.unlink()
 
         host = urlparse(url).netloc
+        # Download to container-local disk, then copy to the volume in one
+        # sequential pass.
+        #
+        # aria2's sixteen connections write by range, seeking around inside the
+        # file. The volume does not survive that: on 2026-08-20 two 20 GB
+        # weights came out with the exact right byte count and holes in them —
+        # one with eight zero bytes where the safetensors header should be, one
+        # 42% zeros through the middle — while aria2 reported OK for both. The
+        # only file that was fine had come down a single stream.
+        #
+        # Same shape as the MP4 problem in the pods: this volume is fine for
+        # sequential I/O and unsafe for seek-and-write-in-place. So the parallel
+        # part happens on local disk, where it is safe, and the volume only ever
+        # sees an append-only copy.
+        staging_dir = tempfile.mkdtemp(prefix="dl-")
+        staged = os.path.join(staging_dir, name)
         cmd = [
             "aria2c",
             "--continue=true",
@@ -114,7 +142,7 @@ def _download(models):
             "--min-split-size=8M",
             "--summary-interval=30",
             "--console-log-level=warn",
-            "--dir=%s" % dest_dir,
+            "--dir=%s" % staging_dir,
             "--out=%s" % name,
         ]
         # Auth is per host, and the two sites want it in different places.
@@ -142,6 +170,7 @@ def _download(models):
             # expected (200 of text/html).
             status = _probe(url, cmd)
             print("  FAIL  %s (aria2c exit %d, server said %s)" % (name, result.returncode, status))
+            shutil.rmtree(staging_dir, ignore_errors=True)
             failed.append(
                 {
                     "name": name,
@@ -156,6 +185,32 @@ def _download(models):
                     "authLen": len(civitai_token or "") if "civitai" in host else None,
                 }
             )
+            continue
+
+        problem = _verify(staged)
+        if problem:
+            # Refusing to publish a bad file is the whole point of staging. A
+            # broken weight on the volume is worse than a missing one: it has the
+            # right name and the right size, so every later check passes and the
+            # failure surfaces minutes into a load, on a GPU.
+            print("  BAD   %s (%s)" % (name, problem))
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            failed.append(
+                {"name": name, "url": url.split("?token=")[0], "http": None, "error": problem}
+            )
+            continue
+
+        print("  copy  %s -> %s" % (name, dest_dir))
+        with open(staged, "rb") as src, open(dest, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=32 * 1024 * 1024)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+        landed = _verify(dest)
+        if landed:
+            print("  BAD   %s after copy (%s)" % (name, landed))
+            failed.append(
+                {"name": name, "url": url.split("?token=")[0], "http": None, "error": landed}
+            )
 
     print("\nVolume contents:")
     for path in sorted(Path(MOUNT_PATH).rglob("*")):
@@ -165,6 +220,56 @@ def _download(models):
     if failed:
         print("\n%d file(s) did not land: %s" % (len(failed), ", ".join(f["name"] for f in failed)))
     return _returned({"failed": failed, "requested": len(models)})
+
+
+def _verify(path):
+    """`None` if the file looks whole, otherwise what is wrong with it.
+
+    Size alone proves nothing here: both corrupted downloads had the exact byte
+    count the server advertised. A safetensors file carries its own checksum of
+    sorts — an 8-byte little-endian header length, then that many bytes of JSON,
+    then tensor data whose last offset must land exactly on the end of the file.
+    Anything that fails those three has holes in it.
+
+    Files that are not safetensors are only checked for being non-empty; there
+    is no format-independent way to tell a hole from data.
+    """
+    import json
+    import os
+    import struct
+
+    # Called with both str and Path from different points in the loop; the
+    # suffix test below is a str method and silently is not a Path one.
+    path = str(path)
+
+    size = os.path.getsize(path)
+    if size == 0:
+        return "empty file"
+    if not path.endswith(".safetensors"):
+        return None
+
+    with open(path, "rb") as handle:
+        head = handle.read(8)
+        if len(head) < 8:
+            return "shorter than a safetensors header"
+        header_len = struct.unpack("<Q", head)[0]
+        if header_len == 0:
+            return "header length is zero (the start of the file was never written)"
+        if header_len > size:
+            return "header length %d exceeds the file" % header_len
+        try:
+            meta = json.loads(handle.read(header_len))
+        except Exception as err:  # noqa: BLE001
+            return "header JSON did not parse (%s)" % err
+
+    ends = [
+        v["data_offsets"][1]
+        for v in meta.values()
+        if isinstance(v, dict) and "data_offsets" in v
+    ]
+    if ends and 8 + header_len + max(ends) != size:
+        return "tensor data ends at %d, file is %d" % (8 + header_len + max(ends), size)
+    return None
 
 
 def _probe(url, cmd):
@@ -235,12 +340,27 @@ def download(models):
 @task_queue(**CONFIG)
 def handler(**payload):
     """HTTP entry point. Body is `{"models": [{url, directory, name, size}]}`."""
-    models = payload.get("models") or []
-    if not isinstance(models, list):
-        return {"failed": [], "error": "models must be a list"}
-    if not models:
-        return {"failed": [], "error": "no models in the request"}
-    return _download(models)
+    # Nothing raises out of here. A task that dies takes its traceback with it:
+    # the result is empty, and the container log is unreadable from this machine
+    # (`beam logs` fails on SSL). Returning the failure is the only channel that
+    # reaches either the panel or a person.
+    import traceback
+
+    try:
+        models = payload.get("models") or []
+        if not isinstance(models, list):
+            return _returned({"failed": [], "error": "models must be a list"})
+        if not models:
+            return _returned({"failed": [], "error": "no models in the request"})
+        return _download(models)
+    except Exception as err:  # noqa: BLE001 - reporting it is the point
+        return _returned(
+            {
+                "failed": [],
+                "error": "%s: %s" % (type(err).__name__, err),
+                "trace": traceback.format_exc()[-2000:],
+            }
+        )
 
 
 USAGE = """usage:

@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { ExternalLink, Loader2, Power, Square } from 'lucide-react'
+import { ExternalLink, Loader2, Power, RefreshCw, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /**
@@ -59,6 +59,16 @@ export function ComfyLabControl() {
 
   useEffect(() => {
     void refresh()
+  }, [refresh])
+
+  // A pod's URL dies with the pod, and nothing tells the tab. Someone who left
+  // this open across a restart was looking at a link that 403s, with no way to
+  // tell from the panel that it had gone stale. Re-checking whenever the tab is
+  // focused covers the case that actually happens: switch away, come back.
+  useEffect(() => {
+    const onFocus = () => void refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
   }, [refresh])
 
   useEffect(() => {
@@ -124,6 +134,14 @@ export function ComfyLabControl() {
         <span className="ml-auto text-[10px] text-white/25">
           {running ? 'running' : starting ? 'starting…' : pod.state === 'unknown' ? '—' : 'stopped'}
         </span>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          title="Re-check with Beam"
+          className="text-white/25 transition-colors hover:text-white/60"
+        >
+          <RefreshCw className="h-3 w-3" />
+        </button>
       </div>
 
       {running && pod.url && (
