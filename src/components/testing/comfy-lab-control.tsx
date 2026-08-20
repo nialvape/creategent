@@ -17,15 +17,21 @@ import { cn } from '@/lib/utils'
  */
 
 interface PodState {
-  state: 'stopped' | 'running' | 'failed' | 'unknown'
+  state: 'stopped' | 'running' | 'starting' | 'failed' | 'unknown'
   url?: string
   containerId?: string
   error?: string
 }
 
+/** How long to keep asking whether a pod that was asked to start has come up. */
+const WATCH_MS = 5_000
+const WATCH_ATTEMPTS = 60
+
 export function ComfyLabControl() {
   const [pod, setPod] = useState<PodState>({ state: 'unknown' })
   const [busy, setBusy] = useState<'start' | 'stop' | null>(null)
+  // Countdown of remaining status checks while a pod is coming up.
+  const [watch, setWatch] = useState(0)
   const [error, setError] = useState<string | null>(null)
 
   const call = useCallback(async (action: string, extra: Record<string, unknown> = {}) => {
@@ -55,6 +61,25 @@ export function ComfyLabControl() {
     void refresh()
   }, [refresh])
 
+  useEffect(() => {
+    if (watch <= 0) return
+    const timer = setTimeout(async () => {
+      try {
+        const next = await call('pod-status')
+        if (next.state === 'running') {
+          setPod(next)
+          setError(null)
+          setWatch(0)
+          return
+        }
+      } catch {
+        // A failed check is not a failed pod; keep counting down.
+      }
+      setWatch((n) => n - 1)
+    }, WATCH_MS)
+    return () => clearTimeout(timer)
+  }, [watch, call])
+
   const act = async (action: 'start' | 'stop') => {
     setBusy(action)
     setError(null)
@@ -64,14 +89,21 @@ export function ComfyLabControl() {
         action === 'stop' && pod.containerId ? { containerId: pod.containerId } : {}
       )
       setPod(next)
+      // Creating a pod can outrun the request that asked for it. Whatever the
+      // answer was, keep asking until the pod reports itself running — the
+      // first Launch produced a live container and a panel that showed nothing,
+      // because a single blocking call was the only thing watching.
+      if (action === 'start' && next.state !== 'running') setWatch(WATCH_ATTEMPTS)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+      if (action === 'start') setWatch(WATCH_ATTEMPTS)
     } finally {
       setBusy(null)
     }
   }
 
   const running = pod.state === 'running'
+  const starting = !running && watch > 0
 
   return (
     <section className="space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
@@ -79,12 +111,18 @@ export function ComfyLabControl() {
         <span
           className={cn(
             'h-1.5 w-1.5 rounded-full',
-            running ? 'bg-emerald-400' : pod.state === 'unknown' ? 'bg-white/20' : 'bg-white/25'
+            running
+              ? 'bg-emerald-400'
+              : starting
+                ? 'animate-pulse bg-amber-400'
+                : pod.state === 'unknown'
+                  ? 'bg-white/20'
+                  : 'bg-white/25'
           )}
         />
         <h2 className="text-xs font-semibold uppercase tracking-wider text-white/50">ComfyUI</h2>
         <span className="ml-auto text-[10px] text-white/25">
-          {running ? 'running' : pod.state === 'unknown' ? '—' : 'stopped'}
+          {running ? 'running' : starting ? 'starting…' : pod.state === 'unknown' ? '—' : 'stopped'}
         </span>
       </div>
 
@@ -103,7 +141,7 @@ export function ComfyLabControl() {
       <div className="flex gap-2">
         <button
           type="button"
-          disabled={busy !== null || running}
+          disabled={busy !== null || running || starting}
           onClick={() => void act('start')}
           className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-indigo-600/80 px-3 py-2 text-[11px] font-medium text-white transition-colors hover:bg-indigo-600 disabled:opacity-40"
         >
@@ -112,7 +150,7 @@ export function ComfyLabControl() {
           ) : (
             <Power className="h-3 w-3" />
           )}
-          {busy === 'start' ? 'Starting…' : 'Launch ComfyUI'}
+          {busy === 'start' || starting ? 'Starting…' : 'Launch ComfyUI'}
         </button>
         <button
           type="button"

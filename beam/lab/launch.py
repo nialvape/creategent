@@ -26,9 +26,7 @@ container: `beta9/config.py` reads `BEAM_TOKEN` from the environment when the
 It is your own account token and it never leaves Beam.
 """
 
-from beam import Image, Volume, task_queue  # noqa: F401  (Volume via app import)
-
-from app import comfyui
+from beam import Image, Output, task_queue
 
 # Port the Pod publishes. Kept in step with `ports=[8000]` in app.py.
 POD_PORT = 8000
@@ -53,16 +51,47 @@ URL_TEMPLATE = "https://%s-%d.app.beam.cloud"
 
 
 def _url_for(container_id):
-    return URL_TEMPLATE % (container_id.removeprefix("pod-"), POD_PORT)
+    """`pod-<uuid>-<suffix>` -> `https://<uuid>-8000.app.beam.cloud`.
+
+    Only the uuid goes in the hostname. A running pod reported
+    `pod-99d7892a-e926-46b0-8a1c-345ef7c37f91-b07e7cfb`, and keeping that last
+    segment produced a URL that 404s while the uuid-only form answers 200 — so
+    the container id carries a suffix the hostname does not.
+    """
+    import re
+
+    match = re.match(
+        r"^pod-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        container_id,
+    )
+    return URL_TEMPLATE % (match.group(1) if match else container_id.removeprefix("pod-"), POD_PORT)
+
+
+def _service():
+    """A gateway client that will not try to interview you.
+
+    `ServiceClient()` with no argument reaches `get_channel(None)`, and that
+    calls `prompt_for_config_context()` — an interactive prompt. In a container
+    there is no stdin, so the task hangs in RUNNING until it is killed, never
+    reaching an exception handler and never writing a result. That is exactly
+    what happened here on 2026-08-19.
+
+    `get_config_context()` is the non-interactive path the SDK's own
+    abstractions use: it reads the config file if there is one and otherwise
+    builds a context from BEAM_TOKEN and the gateway defaults in the
+    environment. Passing it explicitly is the whole fix.
+    """
+    from beta9.channel import ServiceClient
+    from beta9.config import get_config_context
+
+    return ServiceClient(get_config_context())
 
 
 def _running_containers():
-    """Every running container, with the stub id that identifies what it is."""
-    from beta9.channel import ServiceClient
+    """Every running pod container. See _service() for why the client is built."""
     from beta9.clients.gateway import ListContainersRequest
 
-    service = ServiceClient()
-    res = service.gateway.list_containers(ListContainersRequest())
+    res = _service().gateway.list_containers(ListContainersRequest())
     if not res.ok:
         return []
     return [
@@ -83,7 +112,66 @@ def _running_containers():
 )
 def handler(**payload):
     """`{"action": "start" | "status" | "stop", "containerId": "..."}`."""
+    # Every failure is returned, never raised.
+    #
+    # A raised exception here becomes a task in RETRY and then ERROR with an
+    # empty `outputs`, and the only place the traceback exists is the container
+    # log — which `beam logs` could not reach from this machine at all
+    # (SSL: TLSV1_UNRECOGNIZED_NAME before it even connects). Returning the
+    # traceback puts the cause in the task result, where both the poller and a
+    # curl can see it. It also stops Beam burning three retries on a
+    # deterministic error.
+    import traceback
+
+    try:
+        return _returned(_handle(payload))
+    except Exception as err:  # noqa: BLE001 - the whole point is to report it
+        return _returned(
+            {
+                "state": "failed",
+                "error": "%s: %s" % (type(err).__name__, err),
+                "trace": traceback.format_exc()[-2000:],
+            }
+        )
+
+
+def _returned(result):
+    """Return the result AND leave a copy behind as a retrievable file.
+
+    `GET /v2/task/{id}/` does **not** echo a handler's return value — measured
+    2026-08-19, when a task that completed successfully still came back with
+    `result: null` and `outputs: []`. `beam/comfy/README.md` listed that as an
+    open question; this is the answer, and it is why the ComfyUI worker has done
+    the same thing all along.
+
+    So the return value travels as a saved file. `src/providers/beam.ts` already
+    reads `result.json` out of `outputs` this way, and the weights route does
+    the same.
+    """
+    import json
+    import os
+    import tempfile
+
+    try:
+        path = os.path.join(tempfile.mkdtemp(prefix="lab-control-"), "result.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(result, handle)
+        Output(path=path).save()
+    except Exception as err:  # noqa: BLE001
+        print("comfy-lab-control - could not save result.json: %s" % err)
+    return result
+
+
+def _handle(payload):
     action = payload.get("action") or "start"
+
+    if action == "ping":
+        # Touches no SDK and no import. If this answers, the deployment and
+        # the argument binding are fine and the fault is further in.
+        import os
+
+        token = os.environ.get("BEAM_TOKEN") or ""
+        return {"state": "ok", "tokenLen": len(token)}
 
     if action == "status":
         running = _running_containers()
@@ -97,7 +185,6 @@ def handler(**payload):
         }
 
     if action == "stop":
-        from beta9.channel import ServiceClient
         from beta9.clients.gateway import StopContainerRequest
 
         targets = [payload["containerId"]] if payload.get("containerId") else [
@@ -106,7 +193,7 @@ def handler(**payload):
         if not targets:
             return {"state": "stopped", "stopped": []}
 
-        service = ServiceClient()
+        service = _service()
         stopped = []
         for container_id in targets:
             res = service.gateway.stop_container(StopContainerRequest(container_id=container_id))
@@ -128,6 +215,13 @@ def handler(**payload):
             "url": _url_for(container.container_id),
             "reused": True,
         }
+
+    # Imported here, not at module scope. `app.py` builds an Image and a Pod
+    # at import time, and when that raised inside the container the module
+    # never loaded: the task failed with an empty result and my own
+    # try/except — which lives inside the function — never ran. Importing
+    # lazily means any failure in it is reported like every other one.
+    from app import comfyui
 
     res = comfyui.create()
     if not res.ok:

@@ -86,11 +86,83 @@ async function callLabControl(payload: Record<string, unknown>) {
   if (!res.ok) {
     throw new Error(`Beam lab control failed (${res.status}): ${await res.text()}`)
   }
+
+  // A task queue answers with an id, not an answer. Submitting and polling are
+  // one operation from this route's point of view because starting a pod is
+  // seconds, not minutes.
+  const { task_id: taskId } = (await res.json()) as { task_id?: string }
+  if (!taskId) throw new Error('Beam accepted the request but returned no task_id')
+
+  const deadline = Date.now() + 90_000
+  for (;;) {
+    const task = await readTask(taskId, token)
+    const status = (task.status ?? '').toUpperCase()
+    if (DONE.has(status)) return await taskResult(task)
+    if (FAILED.has(status)) {
+      throw new Error(`Beam lab control task ${status.toLowerCase()} (${taskId})`)
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`Beam lab control did not answer in time (task ${taskId})`)
+    }
+    await new Promise((r) => setTimeout(r, 2_000))
+  }
+}
+
+interface BeamTask {
+  status?: string
+  result?: unknown
+  outputs?: { name?: string; url?: string }[]
+}
+
+async function readTask(taskId: string, token: string): Promise<BeamTask> {
+  const res = await fetch(`${BEAM_TASK_API}/${taskId}/`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    throw new Error(`Beam task poll failed (${res.status}): ${await res.text()}`)
+  }
+  return (await res.json()) as BeamTask
+}
+
+/**
+ * A finished task's return value.
+ *
+ * `GET /v2/task/{id}/` does **not** echo what the handler returned — measured
+ * 2026-08-19 against a task that completed successfully and still reported
+ * `result: null`. The value travels as a saved `result.json` in `outputs`
+ * instead, which is the same fallback `src/providers/beam.ts` has always used.
+ * `result` is still read first, in case a future Beam does populate it.
+ */
+async function taskResult(task: BeamTask): Promise<Record<string, unknown>> {
+  if (task.result && typeof task.result === 'object') {
+    return task.result as Record<string, unknown>
+  }
+  const file = task.outputs?.find((o) => o.name === 'result.json' || o.url?.includes('result.json'))
+  if (!file?.url) {
+    throw new Error('Beam task finished but produced no result.json')
+  }
+  const res = await fetch(file.url)
+  if (!res.ok) {
+    throw new Error(`Beam task finished but result.json could not be read (${res.status})`)
+  }
   return (await res.json()) as Record<string, unknown>
 }
 
 async function startPod() {
-  return Response.json({ ok: true, ...(await callLabControl({ action: 'start' })) })
+  // A create that outruns the wait is not a failure, it is a pod still coming
+  // up — and the container it made is real and billing. Reporting an error here
+  // taught the caller to think nothing happened while a GPU was running, which
+  // is the worst of both. `starting` tells the panel to poll instead.
+  try {
+    return Response.json({ ok: true, ...(await callLabControl({ action: 'start' })) })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (message.includes('did not answer in time')) {
+      return Response.json({ ok: true, state: 'starting' })
+    }
+    throw err
+  }
 }
 
 async function podStatus() {
@@ -305,15 +377,19 @@ async function pollDownload(body: Record<string, unknown>) {
     throw new Error(`Beam task poll failed (${res.status}): ${await res.text()}`)
   }
 
-  const task = (await res.json()) as { status?: string; outputs?: unknown; result?: unknown }
+  const task = (await res.json()) as BeamTask
   const status = (task.status ?? '').toUpperCase()
+  const done = DONE.has(status)
 
   return Response.json({
     ok: true,
     taskId,
     status,
-    done: DONE.has(status),
+    done,
     failed: FAILED.has(status),
-    result: task.result ?? null,
+    // Only once finished: the result lives in a saved file, and asking for it
+    // before the task wrote one is a guaranteed miss. A download that reports
+    // per-file failures is still a completed task, so this is worth reading.
+    result: done ? await taskResult(task).catch(() => null) : null,
   })
 }

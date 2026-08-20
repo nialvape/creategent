@@ -88,5 +88,9 @@ own storage as soon as the job is collected; nothing should persist a Beam URL.
   is a static scan, so it blocks the graph even when the branch never runs.
   `download_models.py` skips it unless `include_enhancer=True`. Either download
   it or send `enhancePrompt: false`.
-- Whether `GET /v2/task/{id}/` echoes the handler's return value. The worker
-  saves `result.json` as an output either way and the adapter falls back to it.
+- ~~Whether `GET /v2/task/{id}/` echoes the handler's return value.~~ **Answered
+  2026-08-19: it does not.** A task that completed successfully came back with
+  `result: null` and the return value nowhere in the response. Saving
+  `result.json` as an output is not a belt-and-braces fallback, it is the only
+  channel — `beam/lab/launch.py` failed silently for exactly this reason until
+  it was changed to do the same.
