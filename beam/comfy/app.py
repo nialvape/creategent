@@ -82,7 +82,41 @@ COMFY_URL = "http://127.0.0.1:%d" % COMFY_PORT
 
 # Mirrored into ComfyUI's models/ as symlinks at build time. Symlinks resolve
 # lazily, so it does not matter that the volume is not mounted during the build.
-MODEL_DIRS = ["diffusion_models", "text_encoders", "vae", "latent_upscale_models", "loras"]
+#
+# Every folder ComfyUI knows about, not only the ones today's graphs use. A
+# symlink to a directory that does not exist yet costs nothing — ComfyUI skips
+# it — and it means adding a model in a new category (a controlnet, an upscaler,
+# a clip_vision) is a download, not a rebuild and redeploy of this worker. Same
+# list and same reasoning as runpod/comfyui/extra_model_paths.yaml, plus `unet`
+# where the GGUF loaders look and `clip`, the older name for text encoders.
+MODEL_DIRS = [
+    "checkpoints",
+    "clip",
+    "clip_vision",
+    "controlnet",
+    "diffusers",
+    "diffusion_models",
+    "embeddings",
+    "gligen",
+    "hypernetworks",
+    "latent_upscale_models",
+    "loras",
+    "model_patches",
+    "photomaker",
+    "style_models",
+    "text_encoders",
+    "unet",
+    "upscale_models",
+    "vae",
+    "vae_approx",
+    "audio_encoders",
+    "background_removal",
+    "classifiers",
+    "detection",
+    "frame_interpolation",
+    "geometry_estimation",
+    "optical_flow",
+]
 
 # A cold container spends ~19 minutes reading ~40 GB of weights off the
 # distributed volume before it can answer at all, and Beam bills every second of
@@ -109,6 +143,15 @@ image = (
             # runpod/comfyui/Dockerfile.
             "git clone --depth=1 https://github.com/comfyanonymous/ComfyUI %s" % COMFY_DIR,
             "pip install --no-cache-dir -r %s/requirements.txt" % COMFY_DIR,
+            # comfy-cli is here for one job: `comfy node registry-install <id>@<ver>`
+            # in the custom-node lines below. Custom nodes are pinned HERE, in the
+            # image, never installed at runtime and never inherited from the lab
+            # pod — that pod is a different machine with an ephemeral filesystem.
+            # Generate the lines with:
+            #   python scripts/ingest_workflow.py <workflow.json> --build-commands
+            "pip install --no-cache-dir comfy-cli",
+            # --- pinned custom nodes go below this line ---
+            # (none yet: every graph this worker runs is core-only)
             # Torch LAST and forced: ComfyUI leaves torch unpinned, so pip may
             # resolve a CUDA 12.6 build, and the 5090 is Blackwell (sm_120) which
             # needs 12.8+. Installing after requirements.txt makes the wheel

@@ -54,3 +54,6 @@ __pycache__/
 # Copied out of the repo root by beam/comfy/app.py at deploy time, because Beam
 # syncs only the deploy directory. The root copy is the source of truth.
 beam/comfy/comfy_worker/
+
+# Written by scripts/ingest_workflow.py --download, regenerated every run.
+beam/models/manifest.json

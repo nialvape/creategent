@@ -8,6 +8,8 @@ import { ModelPicker } from '@/components/ui/model-picker'
 import { LabFilePicker, type LabAttachment } from '@/components/testing/lab-file-picker'
 import { LabRunCard, type LabRunRecord } from '@/components/testing/lab-run-card'
 import { VideoParamsPanel } from '@/components/testing/video-params'
+import { WeightsPanel } from '@/components/testing/weights-panel'
+import { ComfyLabControl } from '@/components/testing/comfy-lab-control'
 import { RunPodStatus } from '@/components/testing/runpod-status'
 import { ExportRatingsDialog } from '@/components/testing/export-ratings-dialog'
 import { LTX_DEFAULTS, aspectRatioForSize } from '@/lib/comfy/ltx-2-5-i2v'
@@ -507,6 +509,15 @@ export default function ModelLabPage() {
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
             {busy ? 'Running...' : 'Run model'}
           </Button>
+
+          {/*
+            Below the run button on purpose: this is not part of running a model,
+            it is what you do *before* one can run at all — put its weights on the
+            Beam volume. Grouping it with the inputs would suggest it changes the
+            next run, which it does not.
+          */}
+          <ComfyLabControl />
+          <WeightsPanel />
         </div>
 
         {/* Results side */}

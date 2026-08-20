@@ -23,6 +23,16 @@ pool or a managed compute reservation, which rules out the RTX PRO 6000 96 GB
 The transformers are nearly the same size. The VAE is what decides it — it stays
 resident for the whole sampling loop, and H3's is 3.5× larger.
 
+> **Correction (2026-08-18): that last sentence is wrong, and the "no" above is
+> under review.** ComfyUI's `VAELoader` builds the object at graph load but moves
+> the weights to GPU at *decode*, after sampling — the two phases do not overlap,
+> so the ceiling is the larger one rather than the sum. Redone per phase, H3's
+> sampling peak (20.97 GB transformer, the pruned int8 build) is *smaller* than
+> LTX-2.5's 24.33 GB, and the 42.5 GB figure is disk, not VRAM. See
+> `beam/h3r2v/` for the corrected arithmetic and the Pod that settles it by
+> measurement. This does not change anything about LTX-2.5 below, which was
+> measured, not projected.
+
 ## Budget
 
 39.70 GB of weights. Peak VRAM, given ComfyUI evicts the text encoder before
